@@ -45,7 +45,6 @@ end
 local startHum = pHum()
 if not startHum then warn("[CONSOLE_ROOT] spawn your character first") return end
 S.ws, S.jp, S.jh = startHum.WalkSpeed, startHum.JumpPower, startHum.JumpHeight
-
 S.folder = track(mk("Folder", {Name = "CR_FX"}, workspace))
 S.cc = track(mk("ColorCorrectionEffect", {Tint = Color3.new(1, 1, 1)}, Lighting))
 track(mk("BloomEffect", {Intensity = 0.5, Size = 24, Threshold = 1}, Lighting))
