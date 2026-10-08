@@ -1,4 +1,5 @@
-
+--[[
+    CONSOLE_ROOT  //  BOSS FIGHT v2   (client-side LocalScript, run via Delta)
     - Boss = a clone of YOUR avatar
     - Phase 1 CALM    : runs, flees, walks to map parts, grabs them, throws them
     - Phase 2 ENRAGED : cutscene, flies up, telekinesis throws, rainbow spinning parts
@@ -44,8 +45,9 @@ end
 local startHum = pHum()
 if not startHum then warn("[CONSOLE_ROOT] spawn your character first") return end
 S.ws, S.jp, S.jh = startHum.WalkSpeed, startHum.JumpPower, startHum.JumpHeight
+
 S.folder = track(mk("Folder", {Name = "CR_FX"}, workspace))
-S.cc = track(mk("ColorCorrectionEffect", {Tint = Color3.new(1, 1, 1)}, Lighting))
+S.cc = track(mk("ColorCorrectionEffect", {TintColor = Color3.new(1, 1, 1)}, Lighting))
 track(mk("BloomEffect", {Intensity = 0.5, Size = 24, Threshold = 1}, Lighting))
 
 ----------------------------------------------------------------------
@@ -936,7 +938,7 @@ local function Phase2Cut()
 		return CFrame.lookAt(BR.Position + BR.CFrame.LookVector * 24 + Vector3.new(0, -18, 0), BR.Position)
 	end)
 	Boom(BR.Position, 10) Shake(1.6, 1.2) Flash(0.6)
-	TS:Create(S.cc, TweenInfo.new(1.5), {Tint = Color3.fromRGB(255, 190, 220)}):Play()
+	TS:Create(S.cc, TweenInfo.new(1.5), {TintColor = Color3.fromRGB(255, 190, 220)}):Play()
 	Say("YOU WILL REGRET DOING THAT PLAYER..", 1.8)
 	Rainbow(30)
 	Shake(2, 1)
@@ -977,7 +979,7 @@ local function Phase3Cut()
 	Term("ERROR 0xDEAD :: root integrity compromised")
 	Say("...", 1.8)
 	sh = 0.15 Shake(0.6, 3)
-	TS:Create(S.cc, TweenInfo.new(2), {Tint = Color3.fromRGB(255, 120, 120)}):Play()
+	TS:Create(S.cc, TweenInfo.new(2), {TintColor = Color3.fromRGB(255, 120, 120)}):Play()
 	Say("How could you..", 2.2)
 	sh = 0.5 Shake(1.8, 3)
 	Say("Y7wua w1l1 p4y F0R ThI1S..", 2.4, true)
@@ -988,7 +990,7 @@ local function Phase3Cut()
 		if d:IsA("BasePart") then d.Material = Enum.Material.Neon d.Color = Color3.fromRGB(40, 0, 0) end
 	end
 	S.hl.OutlineColor = Color3.new(1, 1, 1) S.hl.FillColor = Color3.fromRGB(255, 0, 0) S.hl.FillTransparency = 0.4
-	TS:Create(S.cc, TweenInfo.new(1), {Tint = Color3.fromRGB(255, 70, 70)}):Play()
+	TS:Create(S.cc, TweenInfo.new(1), {TintColor = Color3.fromRGB(255, 70, 70)}):Play()
 	S.phase = 3
 	Rainbow(25, true)
 	SpawnClones(4)
