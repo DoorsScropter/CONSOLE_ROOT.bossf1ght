@@ -1,5 +1,4 @@
---[[
-    CONSOLE_ROOT  //  BOSS FIGHT v2   (client-side LocalScript, run via Delta)
+
     - Boss = a clone of YOUR avatar
     - Phase 1 CALM    : runs, flees, walks to map parts, grabs them, throws them
     - Phase 2 ENRAGED : cutscene, flies up, telekinesis throws, rainbow spinning parts
