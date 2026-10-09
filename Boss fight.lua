@@ -1,17 +1,21 @@
 --[[
-    CONSOLE_ROOT  //  BOSS FIGHT v2   (client-side LocalScript, run via Delta)
+    CONSOLE_ROOT  //  BOSS FIGHT v3   (client-side LocalScript, run via Delta)
     - Boss = a clone of YOUR avatar
-    - Phase 1 CALM    : runs, flees, walks to map parts, grabs them, throws them
-    - Phase 2 ENRAGED : cutscene, flies up, telekinesis throws, rainbow spinning parts
-    - Phase 3 MANIAC  : cutscene, glitch dialogue, command spam, neon-black clones (5 dmg/hit), SystemSword
+    - You START with a Sword (model 47433). Phase 1: 1 dmg per swing.
+    - Phase 1 CALM    : boss strolls, rarely throws things, only mild commands
+    - Phase 2 ENRAGED : INTENSE. cutscene, flies, telekinesis, dive-slams (sword window)
+    - Phase 3 MANIAC  : cutscene, glitch dialogue, command spam, neon-black clones (5 dmg/hit)
+    - Healing potions (model 2694037886) spawn around the map: +10 HP
+    - Music per phase
     Everything is local (only you see it). Stop it any time with:  _G.CR_CLEANUP()
 ]]
 
-local Players  = game:GetService("Players")
-local RS       = game:GetService("RunService")
-local TS       = game:GetService("TweenService")
-local Debris   = game:GetService("Debris")
-local Lighting = game:GetService("Lighting")
+local Players      = game:GetService("Players")
+local RS           = game:GetService("RunService")
+local TS           = game:GetService("TweenService")
+local Debris       = game:GetService("Debris")
+local Lighting     = game:GetService("Lighting")
+local SoundService = game:GetService("SoundService")
 
 local LP  = Players.LocalPlayer
 local Cam = workspace.CurrentCamera
@@ -20,12 +24,30 @@ local rnd = Random.new()
 if _G.CR_CLEANUP then pcall(_G.CR_CLEANUP) end
 
 ----------------------------------------------------------------------
+-- CONFIG (edit these)
+----------------------------------------------------------------------
+local CFG = {
+	SWORD_ID        = 47433,
+	POTION_ID       = 2694037886,
+	HEAL            = 10,
+	MUSIC           = {84327194200715, 9038837347, 127159628816581}, -- phase 1 / 2 / 3
+	MUSIC_VOL       = 0.8,
+	SWORD_BOSS_DMG  = {1, 1, 1},   -- damage to the boss per swing, per phase
+	SWORD_CLONE_DMG = 25,          -- damage to clones per swing (phase 3)
+	SWORD_REACH     = 13,
+	SWORD_COOLDOWN  = 0.4,
+	POTION_EVERY    = {12, 9, 7},  -- seconds between potion spawns, per phase
+	POTION_MAX      = 4,
+	POTION_LIFETIME = 45,
+}
+
+----------------------------------------------------------------------
 -- STATE / HELPERS
 ----------------------------------------------------------------------
 local S = {
-	phase = 0, hp = 100, running = true, busy = true, hover = false, over = false,
-	conns = {}, objs = {}, restore = {}, hidden = {}, rb = {}, clones = {}, projs = {},
-	lastCmd = 0, nextMove = 0, nextThrow = 0, dir = 1,
+	phase = 0, hp = 100, running = true, busy = true, hover = false, over = false, diving = false,
+	conns = {}, objs = {}, restore = {}, hidden = {}, rb = {}, clones = {}, projs = {}, potions = {},
+	lastCmd = 0, nextMove = 0, nextThrow = 0, nextDive = 0, nextPotion = 0, dir = 1,
 }
 local Boss, BH, BR, R15
 local BAnim = {}
@@ -49,6 +71,72 @@ S.ws, S.jp, S.jh = startHum.WalkSpeed, startHum.JumpPower, startHum.JumpHeight
 S.folder = track(mk("Folder", {Name = "CR_FX"}, workspace))
 S.cc = track(mk("ColorCorrectionEffect", {TintColor = Color3.new(1, 1, 1)}, Lighting))
 track(mk("BloomEffect", {Intensity = 0.5, Size = 24, Threshold = 1}, Lighting))
+
+----------------------------------------------------------------------
+-- ASSET LOADING (sword + potion)
+----------------------------------------------------------------------
+local function LoadAsset(id)
+	local ok, res = pcall(function() return game:GetObjects("rbxassetid://" .. id) end)
+	if ok and type(res) == "table" and #res > 0 then return res end
+	ok, res = pcall(function() return game:GetService("InsertService"):LoadAsset(id) end)
+	if ok and res then return res:GetChildren() end
+	return nil
+end
+
+local function StripScripts(o)
+	for _, d in ipairs(o:GetDescendants()) do
+		if d:IsA("LuaSourceContainer") then d:Destroy() end
+	end
+end
+
+local function LoadSwordTemplate()
+	local res = LoadAsset(CFG.SWORD_ID)
+	if res then
+		for _, o in ipairs(res) do
+			local t = o:IsA("Tool") and o or o:FindFirstChildWhichIsA("Tool", true)
+			if t then
+				StripScripts(t)
+				t.Name = "Sword"
+				t.CanBeDropped = false
+				t.ToolTip = "Swing at CONSOLE_ROOT"
+				return t
+			end
+		end
+	end
+	warn("[CONSOLE_ROOT] could not load sword model, using fallback sword")
+	local tool = mk("Tool", {
+		Name = "Sword", RequiresHandle = true, CanBeDropped = false, ToolTip = "Swing at CONSOLE_ROOT",
+		GripPos = Vector3.new(0, 0, -1.5), GripForward = Vector3.new(-1, 0, 0), GripRight = Vector3.new(0, 1, 0), GripUp = Vector3.new(0, 0, 1),
+	})
+	mk("Part", {Name = "Handle", Size = Vector3.new(1, 0.8, 4), Material = Enum.Material.Neon, Color = Color3.fromRGB(0, 255, 255)}, tool)
+	return tool
+end
+
+local function LoadPotionTemplate()
+	local m = Instance.new("Model")
+	m.Name = "CR_Potion"
+	local res = LoadAsset(CFG.POTION_ID)
+	if res then
+		for _, o in ipairs(res) do
+			StripScripts(o)
+			if o:IsA("Tool") then
+				for _, ch in ipairs(o:GetChildren()) do ch.Parent = m end
+			elseif o:IsA("BasePart") or o:IsA("Model") then
+				o.Parent = m
+			end
+		end
+	end
+	if not m:FindFirstChildWhichIsA("BasePart", true) then
+		warn("[CONSOLE_ROOT] could not load potion model, using fallback potion")
+		mk("Part", {Name = "Bottle", Shape = Enum.PartType.Ball, Size = Vector3.new(2.2, 2.2, 2.2), Material = Enum.Material.Neon, Color = Color3.fromRGB(80, 255, 140)}, m)
+	end
+	pcall(function() -- normalise size to ~3 studs
+		local sz = m:GetExtentsSize()
+		local mx = math.max(sz.X, sz.Y, sz.Z)
+		if mx > 0 then m:ScaleTo(m:GetScale() * 3 / mx) end
+	end)
+	return m
+end
 
 ----------------------------------------------------------------------
 -- UI  (boss bar, CRT terminal banner, dialogue, black screen, flash)
@@ -88,7 +176,8 @@ local function Term(txt) -- pops up instantly
 	task.delay(2.6, function() if termTok == my then term.Visible = false end end)
 end
 
-local function Flash(a)
+local function Flash(a, col)
+	flash.BackgroundColor3 = col or Color3.fromRGB(255, 0, 0)
 	flash.BackgroundTransparency = 1 - a
 	TS:Create(flash, TweenInfo.new(0.45), {BackgroundTransparency = 1}):Play()
 end
@@ -122,6 +211,31 @@ local function Say(txt, hold, glitch)
 		task.wait(0.06)
 	end
 	dlg.Text = ""
+end
+
+----------------------------------------------------------------------
+-- MUSIC (one track per phase, crossfades)
+----------------------------------------------------------------------
+local curTrack
+local function StopMusic(fade)
+	fade = fade or 1
+	if curTrack then
+		local old = curTrack
+		curTrack = nil
+		TS:Create(old, TweenInfo.new(fade), {Volume = 0}):Play()
+		Debris:AddItem(old, fade + 0.1)
+	end
+end
+
+local function PlayMusic(i)
+	StopMusic(1)
+	local id = CFG.MUSIC[i]
+	if not id then return end
+	local s = mk("Sound", {Name = "CR_Music_" .. i, SoundId = "rbxassetid://" .. id, Looped = true, Volume = 0}, SoundService)
+	track(s)
+	s:Play()
+	TS:Create(s, TweenInfo.new(1.2), {Volume = CFG.MUSIC_VOL}):Play()
+	curTrack = s
 end
 
 ----------------------------------------------------------------------
@@ -174,6 +288,14 @@ local function Seg(part, a, b, w)
 	part.Size = Vector3.new(w, w, math.max((b - a).Magnitude, 0.1))
 	part.CFrame = CFrame.lookAt((a + b) / 2, b)
 end
+local function Ring(pos, col, size, dur) -- expanding flat neon ring
+	local r = mk("Part", {
+		Anchored = true, CanCollide = false, CanQuery = false, CanTouch = false, Material = Enum.Material.Neon, Color = col,
+		Shape = Enum.PartType.Cylinder, Size = Vector3.new(0.3, 2, 2), CFrame = CFrame.new(pos) * CFrame.Angles(0, 0, math.rad(90)), Transparency = 0.2,
+	}, S.folder)
+	TS:Create(r, TweenInfo.new(dur), {Size = Vector3.new(0.3, size, size), Transparency = 1}):Play()
+	Debris:AddItem(r, dur + 0.1)
+end
 local function Hurt(n)
 	if S.over then return end
 	local h = pHum()
@@ -186,6 +308,7 @@ end
 ----------------------------------------------------------------------
 -- BOSS (your own avatar)
 ----------------------------------------------------------------------
+local WALK_CALM = 14
 local function MakeBoss()
 	local c = LP.Character
 	c.Archivable = true
@@ -200,7 +323,7 @@ local function MakeBoss()
 	BH.DisplayName = "CONSOLE_ROOT"
 	BH.HealthDisplayType = Enum.HumanoidHealthDisplayType.AlwaysOff
 	BH.MaxHealth = 1e9 BH.Health = 1e9
-	BH.WalkSpeed = 22 BH.UseJumpPower = true BH.JumpPower = 55
+	BH.WalkSpeed = WALK_CALM BH.UseJumpPower = true BH.JumpPower = 55
 	local pr = pRoot()
 	Boss.Parent = workspace
 	Boss:PivotTo(CFrame.new(pr.Position + pr.CFrame.LookVector * 45 + Vector3.new(0, 3, 0)))
@@ -245,7 +368,7 @@ end
 
 local function Flee(dur)
 	local t0 = os.clock()
-	BH.WalkSpeed = 27
+	BH.WalkSpeed = 22
 	while S.running and not S.busy and os.clock() - t0 < dur do
 		local pr = pRoot()
 		if not pr then break end
@@ -257,7 +380,7 @@ local function Flee(dur)
 		if away.Magnitude > 50 then break end
 		task.wait(0.2)
 	end
-	BH.WalkSpeed = 22
+	BH.WalkSpeed = WALK_CALM
 end
 
 ----------------------------------------------------------------------
@@ -393,7 +516,11 @@ end
 DamageBoss = function(n)
 	if S.busy or S.over or S.hp <= 0 then return end
 	S.hp -= n
-	Boom(BR.Position, 4) Shake(0.6, 0.3)
+	if n >= 5 then
+		Boom(BR.Position, 4) Shake(0.6, 0.3)
+	else -- light hit (sword)
+		Boom(BR.Position, 2) Shake(0.2, 0.12)
+	end
 	S.hl.FillTransparency = 0
 	task.delay(0.1, function() if S.hl.Parent then S.hl.FillTransparency = 0.55 end end)
 	UpdateBar()
@@ -401,7 +528,7 @@ DamageBoss = function(n)
 end
 
 ----------------------------------------------------------------------
--- CLONES (phase 3)  +  SYSTEM SWORD
+-- CLONES (phase 3)
 ----------------------------------------------------------------------
 local function SpawnClone(pos)
 	if #S.clones >= 9 or S.over then return end
@@ -443,33 +570,63 @@ local function SpawnClones(n)
 	end
 end
 
+----------------------------------------------------------------------
+-- SWORD (model 47433, you have it from the start)
+----------------------------------------------------------------------
+local function HasSword()
+	local bp, c = LP:FindFirstChildOfClass("Backpack"), LP.Character
+	return (bp and bp:FindFirstChild("Sword")) or (c and c:FindFirstChild("Sword"))
+end
+
 local function GiveSword()
 	local bp = LP:FindFirstChildOfClass("Backpack")
-	if not bp then return end
-	local tool = mk("Tool", {
-		Name = "SystemSword", RequiresHandle = true, CanBeDropped = false, ToolTip = "25 dmg per slash",
-		GripPos = Vector3.new(0, 0, -1.5), GripForward = Vector3.new(-1, 0, 0), GripRight = Vector3.new(0, 1, 0), GripUp = Vector3.new(0, 0, 1),
-	})
-	mk("Part", {Name = "Handle", Size = Vector3.new(1, 0.8, 4), Material = Enum.Material.Neon, Color = Color3.fromRGB(0, 255, 255)}, tool)
-	tool.Parent = bp
+	if not bp or not S.swordT then return end
+	local tool = S.swordT:Clone()
 	local last = 0
 	tool.Activated:Connect(function()
-		if os.clock() - last < 0.45 then return end
+		if os.clock() - last < CFG.SWORD_COOLDOWN or S.over then return end
 		last = os.clock()
 		local pr = pRoot()
 		if not pr then return end
-		for _, ang in ipairs({50, -50}) do
-			local fx = NewNeon(Color3.fromRGB(0, 255, 255), 0.25)
-			fx.Size = Vector3.new(10, 0.3, 0.3)
-			fx.CFrame = pr.CFrame * CFrame.Angles(0, math.rad(ang), 0) * CFrame.new(0, 0.5, -5)
-			TS:Create(fx, TweenInfo.new(0.2), {Transparency = 1}):Play()
-			Debris:AddItem(fx, 0.25)
-			task.wait(0.07)
+
+		-- swing animation + sound
+		local ta = tool:FindFirstChild("toolanim") or mk("StringValue", {Name = "toolanim"}, tool)
+		ta.Value = "Slash"
+		local handle = tool:FindFirstChild("Handle")
+		local snd = handle and handle:FindFirstChild("SwordSlash")
+		if snd and snd:IsA("Sound") then snd:Play() end
+
+		-- slash arcs
+		task.spawn(function()
+			for _, ang in ipairs({50, -50}) do
+				local fx = NewNeon(Color3.fromRGB(0, 255, 255), 0.25)
+				fx.Size = Vector3.new(10, 0.3, 0.3)
+				fx.CFrame = pr.CFrame * CFrame.Angles(0, math.rad(ang), 0) * CFrame.new(0, 0.5, -5)
+				TS:Create(fx, TweenInfo.new(0.2), {Transparency = 1}):Play()
+				Debris:AddItem(fx, 0.25)
+				task.wait(0.07)
+			end
+		end)
+
+		-- hit the boss
+		if Boss and BR and BR.Parent and not S.busy and S.phase > 0 then
+			local v = BR.Position - pr.Position
+			local fv = flat(v)
+			local lv = flat(pr.CFrame.LookVector)
+			local facing = fv.Magnitude < 3 or (lv.Magnitude > 0.01 and fv.Unit:Dot(lv.Unit) > -0.1)
+			if v.Magnitude <= CFG.SWORD_REACH and facing then
+				DamageBoss(CFG.SWORD_BOSS_DMG[S.phase] or 1)
+				if S.phase == 1 and rnd:NextNumber() < 0.12 then
+					Bubble(({"ow. fair.", "nice swing", "hey, easy", "hm."})[rnd:NextInteger(1, 4)])
+				end
+			end
 		end
+
+		-- hit the clones
 		for _, c in ipairs(S.clones) do
 			local v = c.r.Position - pr.Position
-			if v.Magnitude < 10 and v.Magnitude > 0.1 and v.Unit:Dot(pr.CFrame.LookVector) > 0.1 then
-				c.hp -= 25
+			if v.Magnitude < 11 and v.Magnitude > 0.1 and v.Unit:Dot(pr.CFrame.LookVector) > 0.1 then
+				c.hp -= CFG.SWORD_CLONE_DMG
 				Shake(0.4, 0.15)
 				if c.hp <= 0 then
 					Boom(c.r.Position, 3)
@@ -478,6 +635,9 @@ local function GiveSword()
 			end
 		end
 	end)
+	tool.Parent = bp
+	local h = pHum()
+	if h then pcall(function() h:EquipTool(tool) end) end
 end
 
 task.spawn(function() -- clone brain (one loop for all clones = cheap)
@@ -500,6 +660,142 @@ task.spawn(function() -- clone brain (one loop for all clones = cheap)
 					if d > 220 then c.m:PivotTo(CFrame.new(pr.Position + Vector3.new(20, 4, 0))) end
 				end
 			end
+		end
+	end
+end)
+
+----------------------------------------------------------------------
+-- HEALING POTIONS (model 2694037886): +10 HP
+----------------------------------------------------------------------
+local GREEN = Color3.fromRGB(80, 255, 140)
+
+local function GroundPos()
+	local pr = pRoot()
+	if not pr then return nil end
+	local rp = RaycastParams.new()
+	rp.FilterType = Enum.RaycastFilterType.Exclude
+	rp.FilterDescendantsInstances = {LP.Character, Boss, S.folder}
+	for _ = 1, 10 do
+		local a = rnd:NextNumber(0, math.pi * 2)
+		local r = rnd:NextNumber(18, 55)
+		local o = pr.Position + Vector3.new(math.cos(a) * r, 10, math.sin(a) * r)
+		local hit = workspace:Raycast(o, Vector3.new(0, -60, 0), rp)
+		if hit and hit.Normal.Y > 0.75 and hit.Material ~= Enum.Material.Water
+			and math.abs(hit.Position.Y - pr.Position.Y) < 25 and not isCharPart(hit.Instance) then
+			return hit.Position
+		end
+	end
+	return nil
+end
+
+local function RemovePotion(i)
+	local p = S.potions[i]
+	if not p then return end
+	if p.m then p.m:Destroy() end
+	if p.beacon then p.beacon:Destroy() end
+	table.remove(S.potions, i)
+end
+
+local function SpawnPotion()
+	if #S.potions >= CFG.POTION_MAX or S.over or not S.potionT then return end
+	local g = GroundPos()
+	if not g then return end
+	local m = S.potionT:Clone()
+	m.Parent = S.folder
+	local first
+	for _, d in ipairs(m:GetDescendants()) do
+		if d:IsA("BasePart") then
+			d.Anchored = true d.CanCollide = false d.CanQuery = false d.CanTouch = false d.Massless = true
+			first = first or d
+		end
+	end
+	local base = g + Vector3.new(0, 2.6, 0)
+	m:PivotTo(CFrame.new(base))
+	if first then
+		mk("PointLight", {Range = 14, Brightness = 2.5, Color = GREEN}, first)
+		mk("ParticleEmitter", {
+			Texture = "rbxasset://textures/particles/sparkles_main.dng", Color = ColorSequence.new(GREEN), LightEmission = 1,
+			Rate = 8, Lifetime = NumberRange.new(0.8, 1.4), Speed = NumberRange.new(1, 3), SpreadAngle = Vector2.new(180, 180),
+			Acceleration = Vector3.new(0, 3, 0), Size = NumberSequence.new({NumberSequenceKeypoint.new(0, 0.6), NumberSequenceKeypoint.new(1, 0)}),
+		}, first)
+	end
+	mk("Highlight", {FillTransparency = 1, OutlineColor = GREEN, DepthMode = Enum.HighlightDepthMode.AlwaysOnTop}, m)
+	local beacon = NewNeon(GREEN, 0.6) -- tall light column so you can spot it from afar
+	beacon.Size = Vector3.new(0.6, 60, 0.6)
+	beacon.Position = g + Vector3.new(0, 30, 0)
+	S.potions[#S.potions + 1] = {m = m, base = base, t0 = os.clock(), beacon = beacon, seed = rnd:NextNumber(0, 6)}
+end
+
+local function Collect(i)
+	local p = S.potions[i]
+	if not p then return end
+	RemovePotion(i)
+	local h, pr = pHum(), pRoot()
+	if not h or not pr then return end
+	h.Health = math.min(h.MaxHealth, h.Health + CFG.HEAL)
+
+	Flash(0.3, GREEN)
+	local ground = pr.Position - Vector3.new(0, 2.8, 0)
+	Ring(ground, GREEN, 16, 0.6)
+	Ring(ground, Color3.new(1, 1, 1), 9, 0.45)
+
+	local bp = mk("Part", {Anchored = true, CanCollide = false, CanQuery = false, CanTouch = false, Transparency = 1, Size = Vector3.one, Position = pr.Position}, S.folder)
+	local pe = mk("ParticleEmitter", {
+		Texture = "rbxasset://textures/particles/sparkles_main.dng", Color = ColorSequence.new(Color3.fromRGB(120, 255, 160)), LightEmission = 1,
+		Rate = 0, Lifetime = NumberRange.new(0.6, 1.1), Speed = NumberRange.new(8, 18), SpreadAngle = Vector2.new(180, 180),
+		Acceleration = Vector3.new(0, 10, 0), Size = NumberSequence.new({NumberSequenceKeypoint.new(0, 0.9), NumberSequenceKeypoint.new(1, 0)}),
+	}, bp)
+	pe:Emit(45)
+	Debris:AddItem(bp, 1.5)
+
+	local anchor = mk("Part", {Anchored = true, CanCollide = false, CanQuery = false, CanTouch = false, Transparency = 1, Size = Vector3.one, Position = pr.Position + Vector3.new(0, 3, 0)}, S.folder)
+	local bb = mk("BillboardGui", {Size = UDim2.fromOffset(160, 40), AlwaysOnTop = true}, anchor)
+	local tl = mk("TextLabel", {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Text = "+" .. CFG.HEAL .. " HP", TextColor3 = GREEN, TextStrokeTransparency = 0, Font = Enum.Font.Code, TextScaled = true}, bb)
+	TS:Create(bb, TweenInfo.new(1), {StudsOffset = Vector3.new(0, 4, 0)}):Play()
+	TS:Create(tl, TweenInfo.new(1), {TextTransparency = 1, TextStrokeTransparency = 1}):Play()
+	Debris:AddItem(anchor, 1.1)
+
+	if LP.Character then
+		local hl = mk("Highlight", {FillColor = GREEN, OutlineColor = Color3.new(1, 1, 1), FillTransparency = 0.4, DepthMode = Enum.HighlightDepthMode.Occluded}, LP.Character)
+		TS:Create(hl, TweenInfo.new(0.7), {FillTransparency = 1, OutlineTransparency = 1}):Play()
+		Debris:AddItem(hl, 0.8)
+	end
+
+	local snd = mk("Sound", {SoundId = "rbxasset://sounds/electronicpingshort.wav", Volume = 1, PlaybackSpeed = 1.4}, SoundService)
+	snd:Play()
+	Debris:AddItem(snd, 2)
+end
+
+on(RS.Heartbeat, function() -- bob, spin, expire, pickup
+	local t = os.clock()
+	local pr, h = pRoot(), pHum()
+	for i = #S.potions, 1, -1 do
+		local p = S.potions[i]
+		if not p.m.Parent then
+			if p.beacon then p.beacon:Destroy() end
+			table.remove(S.potions, i)
+		else
+			local age = t - p.t0
+			if age > CFG.POTION_LIFETIME then
+				RemovePotion(i)
+			else
+				local pos = p.base + Vector3.new(0, math.sin(t * 2.5 + p.seed) * 0.5, 0)
+				p.m:PivotTo(CFrame.new(pos) * CFrame.Angles(0, t * 1.8 + p.seed, 0))
+				if pr and h and not S.over and h.Health > 0 and h.Health < h.MaxHealth - 0.5
+					and (pr.Position - pos).Magnitude < 6 then
+					Collect(i)
+				end
+			end
+		end
+	end
+end)
+
+task.spawn(function() -- potion spawner
+	while S.running and not S.over do
+		task.wait(0.5)
+		if S.phase > 0 and os.clock() > S.nextPotion then
+			S.nextPotion = os.clock() + (CFG.POTION_EVERY[S.phase] or 10) + rnd:NextNumber(-2, 2)
+			SpawnPotion()
 		end
 	end
 end)
@@ -533,7 +829,7 @@ function Cmd.laser()
 	if r then
 		local rel = r.Position - origin
 		local proj = rel:Dot(dir)
-		if proj > 0 and (rel - dir * proj).Magnitude < 3.5 then Hurt(8 + 4 * S.phase) end
+		if proj > 0 and (rel - dir * proj).Magnitude < 3.5 then Hurt(4 + 4 * S.phase) end
 	end
 	TS:Create(line, TweenInfo.new(0.35), {Transparency = 1}):Play()
 	Debris:AddItem(line, 0.4)
@@ -655,6 +951,11 @@ local function PickCmd()
 		if S.phase >= 2 then return "laser" end -- hits you while you're stuck
 		return nil
 	end
+	if S.phase == 1 then -- calm: only mild stuff
+		local mild = {"slip", "slip", "laser"}
+		local n = mild[rnd:NextInteger(1, #mild)]
+		return n
+	end
 	local d = (pr.Position - BR.Position).Magnitude
 	local pool = {}
 	local function add(n, w) for _ = 1, w do pool[#pool + 1] = n end end
@@ -668,10 +969,13 @@ local function PickCmd()
 end
 
 local function RunCmd(name)
-	if rnd:NextNumber() < 0.4 then Bubble(TAUNTS[rnd:NextInteger(1, #TAUNTS)]) end
+	if S.phase ~= 1 and rnd:NextNumber() < 0.4 then Bubble(TAUNTS[rnd:NextInteger(1, #TAUNTS)]) end
 	if name == "laser" and S.phase == 3 then
 		task.spawn(Cmd.laser)
 		task.delay(0.35, Cmd.laser)
+	elseif name == "laser" and S.phase == 2 and rnd:NextNumber() < 0.4 then -- intense: double laser sometimes
+		task.spawn(Cmd.laser)
+		task.delay(0.5, Cmd.laser)
 	else
 		task.spawn(Cmd[name])
 	end
@@ -681,7 +985,7 @@ task.spawn(function()
 	while S.running and not S.over do
 		task.wait(0.25)
 		if not S.busy and S.phase > 0 then
-			local cd = ({7, 4.2, 1.6})[S.phase]
+			local cd = ({11, 3, 1.5})[S.phase]
 			if os.clock() - S.lastCmd > cd then
 				S.lastCmd = os.clock()
 				local n = PickCmd()
@@ -728,13 +1032,13 @@ end
 
 on(RS.Heartbeat, function(dt)
 	local t = os.clock()
-	local k = S.phase == 3 and 3 or 1.2
+	local k = S.phase == 3 and 3 or 1.6
 	for i, p in ipairs(S.rb) do
 		if p.Parent then
 			if S.phase == 3 then
 				p.Color = Color3.fromHSV(0.93 + 0.07 * math.sin(t * 6 + i), 1, 0.6 + 0.4 * math.sin(t * 9 + i))
 			else
-				p.Color = Color3.fromHSV((t * 0.4 + i * 0.07) % 1, 1, 1)
+				p.Color = Color3.fromHSV((t * 0.5 + i * 0.07) % 1, 1, 1)
 			end
 			p.CFrame = p.CFrame * CFrame.Angles(0, dt * k * 2, 0)
 		end
@@ -742,7 +1046,7 @@ on(RS.Heartbeat, function(dt)
 end)
 
 ----------------------------------------------------------------------
--- HOVER MOVEMENT (phase 2 & 3)  +  TELEKINESIS
+-- HOVER MOVEMENT (phase 2 & 3)  +  DIVE SLAM  +  TELEKINESIS
 ----------------------------------------------------------------------
 local hoverAng, hoverR, hoverH = 0, 38, 24
 local function StartHover()
@@ -757,9 +1061,10 @@ on(RS.Heartbeat, function(dt)
 	if not S.hover or S.busy or not BR or not BR.Parent then return end
 	local pr = pRoot()
 	if not pr then return end
-	hoverAng += dt * (S.phase == 3 and 1.1 or 0.6) * S.dir
+	hoverAng += dt * (S.phase == 3 and 1.1 or 0.9) * S.dir
 	local tgt = pr.Position + Vector3.new(math.cos(hoverAng) * hoverR, hoverH + math.sin(os.clock() * 2) * 2, math.sin(hoverAng) * hoverR)
-	local pos = BR.Position:Lerp(tgt, math.clamp(dt * (S.phase == 3 and 3.5 or 2), 0, 1))
+	local k = S.diving and 6 or (S.phase == 3 and 3.5 or 2.6)
+	local pos = BR.Position:Lerp(tgt, math.clamp(dt * k, 0, 1))
 	BR.CFrame = CFrame.lookAt(pos, Vector3.new(pr.Position.X, pos.Y, pr.Position.Z))
 end)
 
@@ -770,6 +1075,27 @@ on(RS.Heartbeat, function() -- run / idle animation switching
 	elseif not moving and not BAnim.idle.IsPlaying then BAnim.run:Stop(0.1) BAnim.idle:Play(0.1) end
 end)
 
+local function Dive() -- boss swoops down next to you, then slams. Perfect time to swing your sword.
+	if S.diving then return end
+	S.diving = true
+	Bubble(S.phase == 3 and "DIE." or "COME HERE")
+	Term("./dive --target " .. LP.Name)
+	hoverR, hoverH = 7, 3.5
+	local t0 = os.clock()
+	local dur = S.phase == 3 and 2.2 or 2.8
+	while S.running and not S.busy and os.clock() - t0 < dur do task.wait(0.1) end
+	if S.running and not S.busy then
+		local pr = pRoot()
+		Boom(BR.Position, 8) Shake(1.6, 0.5)
+		if pr then
+			Ring(Vector3.new(BR.Position.X, pr.Position.Y - 2.5, BR.Position.Z), Color3.fromRGB(255, 60, 60), 24, 0.5)
+			if flat(pr.Position - BR.Position).Magnitude < 11 then Hurt(6 + 2 * S.phase) end
+		end
+	end
+	S.nextMove = 0 -- re-roll the orbit
+	S.diving = false
+end
+
 local function Telekinesis(src)
 	if not src or not src.Parent then return end
 	local p = NewProj(src)
@@ -778,7 +1104,7 @@ local function Telekinesis(src)
 	local a1 = mk("Attachment", {}, p)
 	local beam = mk("Beam", {Attachment0 = a0, Attachment1 = a1, Color = ColorSequence.new(Color3.fromRGB(190, 60, 255)), Width0 = 0.4, Width1 = 0.4, LightEmission = 1, FaceCamera = true}, p)
 	local startCF = src.CFrame
-	local liftT = S.phase == 3 and 0.5 or 0.9
+	local liftT = S.phase == 3 and 0.5 or 0.7
 	local t0 = os.clock()
 	while S.running and not S.busy and os.clock() - t0 < liftT do -- levitate
 		local a = (os.clock() - t0) / liftT
@@ -786,7 +1112,7 @@ local function Telekinesis(src)
 		task.wait()
 	end
 	local fromPos = p.Position
-	local t1, pullT = os.clock(), 0.45
+	local t1, pullT = os.clock(), 0.4
 	while S.running and not S.busy and os.clock() - t1 < pullT do -- pull to boss
 		local a = (os.clock() - t1) / pullT
 		local hand = (BR.CFrame * CFrame.new(1.5, 1, -3)).Position
@@ -795,28 +1121,32 @@ local function Telekinesis(src)
 	end
 	beam:Destroy() a0:Destroy()
 	if S.busy or not p.Parent then p:Destroy() return end
-	task.wait(0.2)
+	task.wait(0.15)
 	ThrowAtPlayer(p)
 end
 
-task.spawn(function() -- air brain: repositions + telekinesis throws
+task.spawn(function() -- air brain: repositions + dives + telekinesis throws
 	while S.running and not S.over do
 		task.wait(0.1)
 		if S.phase >= 2 and S.hover and not S.busy then
-			if os.clock() > S.nextMove then
-				S.nextMove = os.clock() + rnd:NextNumber(2, 4)
+			if os.clock() > S.nextMove and not S.diving then
+				S.nextMove = os.clock() + rnd:NextNumber(1.5, 3)
 				S.dir = -S.dir
 				if S.phase == 3 then hoverR = rnd:NextNumber(20, 34) hoverH = rnd:NextNumber(10, 22)
-				else hoverR = rnd:NextNumber(26, 42) hoverH = rnd:NextNumber(14, 28) end
+				else hoverR = rnd:NextNumber(20, 36) hoverH = rnd:NextNumber(8, 20) end
 			end
-			if os.clock() > S.nextThrow then
+			if os.clock() > S.nextDive and not S.diving then
+				S.nextDive = os.clock() + (S.phase == 3 and rnd:NextNumber(6, 9) or rnd:NextNumber(8, 12))
+				task.spawn(Dive)
+			elseif os.clock() > S.nextThrow and not S.diving then
 				if S.phase == 3 then
 					task.spawn(Telekinesis, PickPart(140))
 					Telekinesis(PickPart(140))
 					S.nextThrow = os.clock() + rnd:NextNumber(1.2, 2.2)
-				else
-					Telekinesis(PickPart(140))
-					S.nextThrow = os.clock() + rnd:NextNumber(2.5, 4)
+				else -- intense phase 2: faster, sometimes double throws
+					task.spawn(Telekinesis, PickPart(140))
+					if rnd:NextNumber() < 0.4 then task.spawn(Telekinesis, PickPart(140)) end
+					S.nextThrow = os.clock() + rnd:NextNumber(1.4, 2.6)
 				end
 			end
 		end
@@ -824,7 +1154,7 @@ task.spawn(function() -- air brain: repositions + telekinesis throws
 end)
 
 ----------------------------------------------------------------------
--- PHASE 1 BRAIN (grab a part -> throw it)
+-- PHASE 1 BRAIN (calm: strolls, rarely grabs a part and tosses it)
 ----------------------------------------------------------------------
 local function GrabAndThrow(src)
 	Bubble("mine.")
@@ -846,21 +1176,30 @@ local function GrabAndThrow(src)
 	task.wait(0.7)
 end
 
+local CALM = {"easy there", "no rush", "take your time", "nice day for a fight", "hmm.", "go on, swing"}
 local function Phase1Think()
 	local pr = pRoot()
 	if not pr then task.wait(0.5) return end
 	local d = flat(pr.Position - BR.Position).Magnitude
-	if d < 16 then -- you're too close: he runs
-		if rnd:NextNumber() < 0.5 then Bubble("back off") end
-		Flee(2.5)
+	if d < 14 then -- you're close: he just stands there calmly (you can hit him)
+		if rnd:NextNumber() < 0.2 then
+			Bubble("whoa, easy")
+			Flee(1.5)
+		else
+			BH:MoveTo(BR.Position)
+			BR.CFrame = CFrame.lookAt(BR.Position, Vector3.new(pr.Position.X, BR.Position.Y, pr.Position.Z))
+			task.wait(rnd:NextNumber(0.8, 1.6))
+		end
 		return
 	end
-	if rnd:NextNumber() < 0.6 then
+	if rnd:NextNumber() < 0.35 then
 		local part = PickPart(80)
-		if part then GrabAndThrow(part) return end
+		if part then GrabAndThrow(part) task.wait(rnd:NextNumber(1.5, 3)) return end
 	end
-	local a = rnd:NextNumber(0, math.pi * 2) -- kite around you
-	WalkTo(pr.Position + Vector3.new(math.cos(a), 0, math.sin(a)) * rnd:NextNumber(30, 45), 3, 4)
+	if rnd:NextNumber() < 0.15 then Bubble(CALM[rnd:NextInteger(1, #CALM)]) end
+	local a = rnd:NextNumber(0, math.pi * 2) -- stroll near you
+	WalkTo(pr.Position + Vector3.new(math.cos(a), 0, math.sin(a)) * rnd:NextNumber(10, 22), 4, 4)
+	task.wait(rnd:NextNumber(0.5, 1.5))
 end
 
 task.spawn(function()
@@ -884,6 +1223,7 @@ end
 local function Prep()
 	S.busy = true
 	Lock(true)
+	StopMusic(0.8)
 	for p in pairs(S.projs) do p:Destroy() end
 	S.projs = {}
 	if S.jailed or S.frozen then Cmd.thaw() end
@@ -908,7 +1248,7 @@ local function Intro()
 	Say("So... you found the root console.", 2)
 	Shake(0.8, 0.8)
 	Say("Every admin command in this place answers to ME.", 2.4)
-	Say("Let's play, player.", 1.6)
+	Say("Grab your sword. I'll go easy.. at first.", 2.2)
 	Boom(BR.Position, 8) Shake(1.5, 0.8) Flash(0.5)
 	EndCine()
 	Lock(false)
@@ -940,13 +1280,18 @@ local function Phase2Cut()
 	Boom(BR.Position, 10) Shake(1.6, 1.2) Flash(0.6)
 	TS:Create(S.cc, TweenInfo.new(1.5), {TintColor = Color3.fromRGB(255, 190, 220)}):Play()
 	Say("YOU WILL REGRET DOING THAT PLAYER..", 1.8)
-	Rainbow(30)
+	Rainbow(45)
 	Shake(2, 1)
 	EndCine()
 	Lock(false)
 	S.phase = 2 S.hp = 100 UpdateBar()
-	hoverR, hoverH = 38, 24
-	S.nextThrow = os.clock() + 2
+	PlayMusic(2)
+	hoverR, hoverH = 30, 16
+	S.nextThrow = os.clock() + 1.5
+	S.nextDive = os.clock() + 6
+	S.lastCmd = os.clock()
+	S.nextPotion = os.clock() + 3
+	SpawnPotion()
 	StartHover()
 	S.busy = false
 end
@@ -992,17 +1337,21 @@ local function Phase3Cut()
 	S.hl.OutlineColor = Color3.new(1, 1, 1) S.hl.FillColor = Color3.fromRGB(255, 0, 0) S.hl.FillTransparency = 0.4
 	TS:Create(S.cc, TweenInfo.new(1), {TintColor = Color3.fromRGB(255, 70, 70)}):Play()
 	S.phase = 3
+	PlayMusic(3)
 	Rainbow(25, true)
 	SpawnClones(4)
-	GiveSword()
-	Term("spawn --clones --sword SystemSword")
+	if not HasSword() then GiveSword() end
+	Term("spawn --clones")
 	task.wait(0.8)
 	EndCine()
 	Lock(false)
 	S.hp = 100 UpdateBar()
 	hoverR, hoverH = 26, 14
 	S.nextThrow = os.clock() + 1.5
+	S.nextDive = os.clock() + 5
 	S.lastCmd = os.clock()
+	S.nextPotion = os.clock() + 2
+	SpawnPotion() SpawnPotion()
 	StartHover()
 	S.busy = false
 end
@@ -1012,6 +1361,7 @@ local Cleanup
 local function Victory()
 	S.over = true
 	Lock(true)
+	StopMusic(2)
 	for p in pairs(S.projs) do p:Destroy() end
 	for _, c in ipairs(S.clones) do Boom(c.r.Position, 4) c.m:Destroy() end
 	S.clones = {}
@@ -1062,7 +1412,7 @@ Cleanup = function()
 	local bp = LP:FindFirstChildOfClass("Backpack")
 	for _, holder in ipairs({bp, LP.Character}) do
 		if holder then
-			for _, n in ipairs({"Prop", "SystemSword"}) do
+			for _, n in ipairs({"Prop", "Sword"}) do
 				local t = holder:FindFirstChild(n)
 				if t then t:Destroy() end
 			end
@@ -1077,10 +1427,13 @@ _G.CR_CLEANUP = Cleanup
 -- MAIN
 ----------------------------------------------------------------------
 task.spawn(function()
+	S.swordT = LoadSwordTemplate()
+	S.potionT = LoadPotionTemplate()
 	MakeBoss()
 	on(pHum().Died, function() -- you died
 		if S.over then return end
 		S.over = true S.busy = true
+		StopMusic(1)
 		Flash(1)
 		dlg.Text = "YOU DIED."
 		Term("kill -9 " .. LP.Name)
@@ -1089,7 +1442,12 @@ task.spawn(function()
 	Intro()
 	S.phase = 1 S.hp = 100
 	UpdateBar()
+	GiveSword()
+	PlayMusic(1)
 	S.busy = false
 	S.lastCmd = os.clock()
+	S.nextPotion = os.clock() + 6
+	SpawnPotion() SpawnPotion()
+	Term("equipped :: Sword (1 dmg per swing)")
 	warn("[CONSOLE_ROOT] fight started. Stop with _G.CR_CLEANUP()")
 end)
