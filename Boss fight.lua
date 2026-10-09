@@ -1,8 +1,8 @@
 --[[
     CONSOLE_ROOT  //  BOSS FIGHT v5   (client-side LocalScript, run via Delta)
-    - Boss = a clone of YOUR avatar (Collisions OFF for fairness)
+    - Boss = a clone of YOUR avatar (Collisions OFF, no fleeing in Phase 1)
     - You START with a Sword (model 47433). Phase 1: 1 dmg per swing.
-    - Phase 1 CALM    : boss strolls, rarely throws things, only mild commands
+    - Phase 1 CALM    : boss strolls, rarely throws things, stays close so you can hit him
     - Phase 2 ENRAGED : INTENSE. cutscene, flies, telekinesis, dive-slams, stretched/glitched neon parts, cooldowns active
     - Phase 3 MANIAC  : cutscene, glitch dialogue, command spam, unstable neon parts, neon-black clones (5 dmg/hit)
     - Healing potions (model 2694037886) spawn around the map: +10 HP
@@ -143,7 +143,7 @@ local function LoadPotionTemplate()
 end
 
 ----------------------------------------------------------------------
--- UI  (boss bar, CRT terminal banner, dialogue, black screen, flash)
+-- UI
 ----------------------------------------------------------------------
 local gui = mk("ScreenGui", {Name = "CONSOLE_ROOT_UI", ResetOnSpawn = false, IgnoreGuiInset = true, DisplayOrder = 999}, nil)
 pcall(function() gui.Parent = (gethui and gethui()) or game:GetService("CoreGui") end)
@@ -276,10 +276,9 @@ local function Lock(on_)
 end
 
 ----------------------------------------------------------------------
--- FX HELPERS (No explosive effects on sword hits - custom special effects added)
+-- FX HELPERS
 ----------------------------------------------------------------------
 local function SpecialSwordHitFX(pos)
-	-- Special non-explosive neon sparks & rings instead of explosions when hitting boss
 	local p = mk("Part", {
 		Anchored = true, CanCollide = false, CanQuery = false, CanTouch = false,
 		Material = Enum.Material.Neon, Color = Color3.fromRGB(0, 255, 255),
@@ -337,7 +336,7 @@ local function Hurt(n)
 end
 
 ----------------------------------------------------------------------
--- BOSS (Collisions disabled completely so he never gets stuck)
+-- BOSS
 ----------------------------------------------------------------------
 local WALK_CALM = 14
 local function MakeBoss()
@@ -356,7 +355,6 @@ local function MakeBoss()
 	BH.MaxHealth = 1e9 BH.Health = 1e9
 	BH.WalkSpeed = WALK_CALM BH.UseJumpPower = true BH.JumpPower = 55
 
-	-- TURN OFF COLLISIONS FOR ALL BOSS PARTS SO HE NEVER GETS STUCK
 	for _, d in ipairs(Boss:GetDescendants()) do
 		if d:IsA("BasePart") then
 			d.CanCollide = false
@@ -405,23 +403,6 @@ local function WalkTo(pos, timeout, stopDist)
 		task.wait(0.15)
 	end
 	return false
-end
-
-local function Flee(dur)
-	local t0 = os.clock()
-	BH.WalkSpeed = 22
-	while S.running and not S.busy and os.clock() - t0 < dur do
-		local pr = pRoot()
-		if not pr then break end
-		local away = flat(BR.Position - pr.Position)
-		if away.Magnitude < 1 then away = Vector3.new(1, 0, 0) end
-		local side = Vector3.new(-away.Z, 0, away.X).Unit * rnd:NextNumber(-20, 20)
-		BH:MoveTo(BR.Position + away.Unit * 30 + side)
-		if flat(BR.AssemblyLinearVelocity).Magnitude < 2 then BH.Jump = true end
-		if away.Magnitude > 50 then break end
-		task.wait(0.2)
-	end
-	BH.WalkSpeed = WALK_CALM
 end
 
 ----------------------------------------------------------------------
@@ -523,7 +504,7 @@ end
 local function ThrowAtPlayer(p)
 	local pr = pRoot()
 	if not pr then p:Destroy() return end
-	local speed = 38 + S.phase * 10 -- slowed down slightly for fairness
+	local speed = 38 + S.phase * 10
 	local d0 = (pr.Position - p.Position).Magnitude
 	local aim = pr.Position + pr.AssemblyLinearVelocity * (d0 / speed) * 0.5
 	local dir = (aim - p.Position).Unit
@@ -558,7 +539,7 @@ DamageBoss = function(n)
 	S.hp -= n
 	if n >= 5 then
 		Boom(BR.Position, 4) Shake(0.6, 0.3)
-	else -- light hit (sword) with custom special effect instead of explosion
+	else
 		SpecialSwordHitFX(BR.Position)
 		Shake(0.2, 0.12)
 	end
@@ -998,7 +979,7 @@ local function DropPart(src)
 end
 
 ----------------------------------------------------------------------
--- BOSS COMMANDS (Balanced with proper cooldowns)
+-- BOSS COMMANDS
 ----------------------------------------------------------------------
 local Cmd = {}
 
@@ -1129,7 +1110,7 @@ function Cmd.freeze()
 	local ice = NewNeon(Color3.fromRGB(150, 230, 255), 0.4)
 	ice.Size = Vector3.new(5, 7, 5) ice.CFrame = pr.CFrame
 	S.ice = ice
-	task.wait(2.0) -- reduced freeze duration for fairness
+	task.wait(2.0)
 	if S.frozen then Cmd.thaw() end
 end
 
@@ -1153,7 +1134,7 @@ function Cmd.jail()
 	wall(Vector3.new(0, 7, 0), Vector3.new(10, 0.6, 10))
 	S.jailParts = parts
 	Shake(0.8, 0.4) Boom(c, 4)
-	task.wait(3.8) -- shortened jail duration so you aren't trapped too long
+	task.wait(3.8)
 	if S.jailed then Cmd.thaw() end
 end
 
@@ -1171,7 +1152,6 @@ local function PickCmd()
 		local mild = {"slip", "laser"}
 		return mild[rnd:NextInteger(1, #mild)]
 	end
-	-- Balanced weight pool to avoid harsh combo spam in Phase 2 & 3
 	local pool = {}
 	local function add(n, w) for _ = 1, w do pool[#pool + 1] = n end end
 	add("laser", 4) add("slip", 2) add("laserprop", 3) add("fling", 1) add("freeze", 1) add("jail", 1)
@@ -1195,7 +1175,6 @@ task.spawn(function()
 	while S.running and not S.over do
 		task.wait(0.25)
 		if not S.busy and S.phase > 0 then
-			-- Enforced proper cooldowns depending on the phase so he doesn't spam attacks endlessly
 			local cd = ({6.0, 4.5, 3.2})[S.phase]
 			if os.clock() - S.lastCmd > cd then
 				S.lastCmd = os.clock()
@@ -1207,7 +1186,7 @@ task.spawn(function()
 end)
 
 ----------------------------------------------------------------------
--- NEON MAP PARTS (Phase 2 stretching/glitching & Phase 3 instability)
+-- NEON MAP PARTS
 ----------------------------------------------------------------------
 local function Rainbow(count, glow)
 	local pr = pRoot()
@@ -1243,14 +1222,13 @@ on(RS.Heartbeat, function(dt)
 	for i, p in ipairs(S.rb) do
 		if p.Parent then
 			if S.phase == 3 then
-				-- Phase 3: Unstable glitching and stretching behavior
 				p.Color = Color3.fromHSV(0.93 + 0.07 * math.sin(t * 6 + i), 1, 0.6 + 0.4 * math.sin(t * 9 + i))
-				if originalData and originalData.Size then
-					local origSz = originalData.Size
+				local orig = S.restore[p]
+				if orig and orig.Size then
+					local origSz = orig.Size
 					p.Size = origSz + Vector3.new(math.sin(t * 15 + i) * 1.5, math.cos(t * 12 + i) * 1.5, math.sin(t * 10 + i) * 1.5)
 				end
 			elseif S.phase == 2 then
-				-- Phase 2: Parts neon can sometimes stretch a little and glitch a little
 				p.Color = Color3.fromHSV((t * 0.5 + i * 0.07) % 1, 1, 1)
 				if rnd:NextNumber() < 0.1 then
 					local orig = S.restore[p]
@@ -1364,7 +1342,7 @@ task.spawn(function()
 					S.nextThrow = os.clock() + rnd:NextNumber(2.0, 3.0)
 				else
 					task.spawn(Telekinesis, PickPart(140))
-					S.nextThrow = os.clock() + rnd:NextNumber(2.5, 4.0) -- balanced throw intervals
+					S.nextThrow = os.clock() + rnd:NextNumber(2.5, 4.0)
 				end
 			end
 		end
@@ -1372,7 +1350,7 @@ task.spawn(function()
 end)
 
 ----------------------------------------------------------------------
--- PHASE 1 BRAIN
+-- PHASE 1 BRAIN (Fixed: Boss walks straight up to you instead of fleeing)
 ----------------------------------------------------------------------
 local function GrabAndThrow(src)
 	Bubble("mine.")
@@ -1399,24 +1377,23 @@ local function Phase1Think()
 	local pr = pRoot()
 	if not pr then task.wait(0.5) return end
 	local d = flat(pr.Position - BR.Position).Magnitude
+	
 	if d < 14 then
-		if rnd:NextNumber() < 0.2 then
-			Bubble("whoa, easy")
-			Flee(1.5)
-		else
-			BH:MoveTo(BR.Position)
-			BR.CFrame = CFrame.lookAt(BR.Position, Vector3.new(pr.Position.X, BR.Position.Y, pr.Position.Z))
-			task.wait(rnd:NextNumber(0.8, 1.6))
-		end
+		-- Boss stays close to you and faces you so you can easily hit him with your sword!
+		BH:MoveTo(BR.Position)
+		BR.CFrame = CFrame.lookAt(BR.Position, Vector3.new(pr.Position.X, BR.Position.Y, pr.Position.Z))
+		task.wait(rnd:NextNumber(0.8, 1.6))
 		return
 	end
+	
 	if rnd:NextNumber() < 0.35 then
 		local part = PickPart(80)
 		if part then GrabAndThrow(part) task.wait(rnd:NextNumber(1.5, 3)) return end
 	end
 	if rnd:NextNumber() < 0.15 then Bubble(CALM[rnd:NextInteger(1, #CALM)]) end
-	local a = rnd:NextNumber(0, math.pi * 2)
-	WalkTo(pr.Position + Vector3.new(math.cos(a), 0, math.sin(a)) * rnd:NextNumber(10, 22), 4, 4)
+	
+	-- Walk right toward you instead of running away
+	WalkTo(pr.Position + Vector3.new(rnd:NextNumber(-4, 4), 0, rnd:NextNumber(-4, 4)), 4, 3)
 	task.wait(rnd:NextNumber(0.5, 1.5))
 end
 
