@@ -1,12 +1,12 @@
 --[[
-    CONSOLE_ROOT  //  BOSS FIGHT v4   (client-side LocalScript, run via Delta)
+    CONSOLE_ROOT  //  BOSS FIGHT v5   (client-side LocalScript, run via Delta)
     - Boss = a clone of YOUR avatar
     - You START with a Sword (model 47433). Phase 1: 1 dmg per swing.
     - Phase 1 CALM    : boss strolls, rarely throws things, only mild commands
     - Phase 2 ENRAGED : INTENSE. cutscene, flies, telekinesis, dive-slams (sword window),
-                        LASER DROPS: he lasers map objects and they fall on you (80 dmg)
+                        LASER CUTS: he slices map objects in half, the TOP HALF falls on you (80 dmg)
     - Phase 3 MANIAC  : cutscene, glitch dialogue, command spam, neon-black clones (5 dmg/hit),
-                        double laser drops
+                        double laser cuts
     - Healing potions (model 2694037886) spawn around the map: +10 HP
     - Music per phase
     Everything is local (only you see it). Stop it any time with:  _G.CR_CLEANUP()
@@ -41,9 +41,10 @@ local CFG = {
 	POTION_EVERY    = {12, 9, 7},  -- seconds between potion spawns, per phase
 	POTION_MAX      = 4,
 	POTION_LIFETIME = 45,
-	FALL_DMG        = 80,          -- damage when a laser-dropped object lands on you
+	FALL_DMG        = 80,          -- damage when a cut-off half lands on you
 	DROP_RANGE      = 30,          -- boss picks objects within this many studs of you
 	DROP_GRAVITY    = 0.7,         -- 1 = normal gravity, lower = more time to dodge
+	CUT_MIN_HEIGHT  = 2,           -- objects shorter than this just fall whole (no cut)
 }
 
 ----------------------------------------------------------------------
@@ -806,7 +807,8 @@ task.spawn(function() -- potion spawner
 end)
 
 ----------------------------------------------------------------------
--- FALLING PARTS (laser drops, phase 2 & 3): object falls, 80 dmg + fall anim if it lands on you
+-- LASER CUTS (phase 2 & 3): object is sliced in half, TOP HALF falls
+-- 80 dmg + fall animation if it lands on you
 ----------------------------------------------------------------------
 local function Marker(pos, d) -- pulsing red warning circle on the ground where it will land
 	local m = mk("Part", {
@@ -863,29 +865,74 @@ local function PickDropPart() -- prefers objects hanging above you, otherwise an
 	return list[rnd:NextInteger(1, #list)]
 end
 
+local function withDim(v, i, val)
+	local t = {v.X, v.Y, v.Z}
+	t[i] = val
+	return Vector3.new(t[1], t[2], t[3])
+end
+
+-- Slices the projectile copy `p` through its middle (along whichever of its axes points most "up").
+-- p becomes the TOP half (it will fall). The BOTTOM half stays behind as a stump with a glowing red cut.
+-- Returns true if it was cut, false if it was too short to cut.
+local function SplitPart(src, p)
+	local cf, psz = p.CFrame, p.Size
+	local axes = {cf.RightVector, cf.UpVector, cf.LookVector}
+	local best, bestDot = 2, -1
+	for i, v in ipairs(axes) do
+		if math.abs(v.Y) > bestDot then best, bestDot = i, math.abs(v.Y) end
+	end
+	local dim = ({psz.X, psz.Y, psz.Z})[best]
+	if dim < CFG.CUT_MIN_HEIGHT then return false end
+	local vec = axes[best]
+	if vec.Y < 0 then vec = -vec end -- always points up
+	local halfSz = withDim(psz, best, dim / 2)
+
+	-- bottom half (stays standing for as long as the original is hidden)
+	local stump = mk("Part", {
+		Size = halfSz, Color = p.Color, Material = p.Material, Anchored = true, CanCollide = false, CanQuery = false, CanTouch = false,
+		CFrame = cf - vec * (dim / 4),
+	}, S.folder)
+	Debris:AddItem(stump, 6)
+
+	-- glowing red cut line on the stump
+	local cut = mk("Part", {
+		Size = withDim(psz + Vector3.new(0.15, 0.15, 0.15), best, 0.2), Color = Color3.fromRGB(255, 40, 40), Material = Enum.Material.Neon,
+		Anchored = true, CanCollide = false, CanQuery = false, CanTouch = false, CFrame = cf, Transparency = 0.1,
+	}, S.folder)
+	TS:Create(cut, TweenInfo.new(1.4), {Transparency = 1}):Play()
+	Debris:AddItem(cut, 1.5)
+
+	-- top half becomes the falling projectile
+	p.Size = halfSz
+	p.CFrame = cf + vec * (dim / 4)
+	return true
+end
+
 local function DropPart(src)
 	if not src or not src.Parent or S.over then return end
 	local pr = pRoot()
 	if not pr then return end
 	local p = NewProj(src) -- visual copy, hides the original for a few seconds
+	SplitPart(src, p)      -- cut in half: p is now the top half
 	local sz = p.Size
+	local startPos = p.Position
 	local g = workspace.Gravity * CFG.DROP_GRAVITY
 	local rp = RaycastParams.new()
 	rp.FilterType = Enum.RaycastFilterType.Exclude
 	rp.FilterDescendantsInstances = {S.folder, Boss, LP.Character, src}
 
-	local off = src.Position - pr.Position
-	local below = workspace:Raycast(src.Position, Vector3.new(0, -400, 0), rp)
+	local off = startPos - pr.Position
+	local below = workspace:Raycast(startPos, Vector3.new(0, -400, 0), rp)
 	local groundY = below and below.Position.Y or (pr.Position.Y - 3)
-	local h0 = math.max(src.Position.Y - sz.Y / 2 - groundY, 0.5)
+	local h0 = math.max(startPos.Y - sz.Y / 2 - groundY, 0.5)
 	local vy = (off.Y < 4) and 62 or -4 -- low objects get blasted into the air first
 	local t = (vy + math.sqrt(vy * vy + 2 * g * h0)) / g -- time until it lands
 	local aimAt = pr.Position + pr.AssemblyLinearVelocity * 0.25
-	local toP = flat(aimAt - src.Position)
+	local toP = flat(aimAt - startPos)
 	local vxz = toP * rnd:NextNumber(0.85, 1.0) / t -- drifts toward where you are
 	local vel = Vector3.new(vxz.X, vy, vxz.Z)
 
-	local land = src.Position + Vector3.new(vxz.X * t, 0, vxz.Z * t)
+	local land = startPos + Vector3.new(vxz.X * t, 0, vxz.Z * t)
 	local lr = workspace:Raycast(land + Vector3.new(0, 60, 0), Vector3.new(0, -400, 0), rp)
 	local marker = Marker(Vector3.new(land.X, (lr and lr.Position.Y or groundY) + 0.15, land.Z), math.max(sz.X, sz.Z) * 1.4 + 6)
 	local spin = Vector3.new(rnd:NextNumber(-4, 4), rnd:NextNumber(-4, 4), rnd:NextNumber(-4, 4))
@@ -961,17 +1008,17 @@ function Cmd.laser()
 	Debris:AddItem(line, 0.4)
 end
 
-function Cmd.laserprop() -- lasers a map object so it falls (phase 2 & 3 only)
+function Cmd.laserprop() -- lasers a map object through its middle: top half falls (phase 2 & 3 only)
 	local pr = pRoot()
 	if not pr or not Boss or S.phase < 2 then return end
 	local src = PickDropPart()
 	if not src then return Cmd.laser() end -- nothing nearby: normal laser at you
-	Term(";laser " .. src.Name)
+	Term(";laser --cut " .. src.Name)
 	local head = Boss.Head
 	local line = NewNeon(Color3.fromRGB(255, 0, 0), 0.4)
 	for i = 1, 8 do
 		if not S.running or S.busy or not src.Parent or S.hidden[src] then line:Destroy() return end
-		Seg(line, head.Position, src.Position, 0.25)
+		Seg(line, head.Position, src.Position, 0.25) -- aims at the middle of the object
 		line.Transparency = (i % 2 == 0) and 0.6 or 0.2
 		task.wait(0.06)
 	end
@@ -1109,7 +1156,7 @@ local function PickCmd()
 	local pool = {}
 	local function add(n, w) for _ = 1, w do pool[#pool + 1] = n end end
 	add("laser", 3) add("blackscreen", 1) add("fling", 2) add("slip", 2) add("jail", 2) add("freeze", 1)
-	add("laserprop", S.phase == 3 and 4 or 3)                           -- laser objects so they fall on you
+	add("laserprop", S.phase == 3 and 4 or 3)                           -- laser-cut objects so they fall on you
 	if d < 22 then add("slip", 3) add("fling", 3) add("jail", 2) end   -- you're close: punish
 	if d < 30 then add("laserprop", 2) end
 	if holdingProp() then add("blackscreen", 3) add("laser", 2) end   -- you're armed: blind/shoot you
