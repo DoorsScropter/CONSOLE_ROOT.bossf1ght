@@ -1,10 +1,14 @@
 --[[
-  NIGHTMARE BOSS  |  5-phase client-side boss fight  |  Delta / mobile executors
+  NIGHTMARE BOSS v2  |  5-phase client-side boss fight  |  Delta / mobile executors
   Everything is local (only you see it). Re-executing the script cleans up the old run first.
+
+  v2: segmented realistic tentacles EVERYWHERE, swarms of legged environment crawlers,
+      PERMANENT map corruption (flesh / stretch / dissolve / levitate, breathing flesh, eyes),
+      difficulty that climbs every phase, eruptions, bigger orb fans, rage as the boss gets hurt.
 
   Mobile buttons (ContextActionService): SLASH (Purifying Sword) and DASH (1s cooldown, i-frames)
   PC keys: E / left click = slash, Q = dash
-  Tweak positions/damage/HP in CFG below.
+  Tweak everything in CFG below (arrays are indexed by phase 1-5).
 ]]
 
 local genv = (getgenv and getgenv()) or _G
@@ -16,6 +20,7 @@ local TweenService = game:GetService("TweenService")
 local CAS = game:GetService("ContextActionService")
 local Debris = game:GetService("Debris")
 local Workspace = game:GetService("Workspace")
+local Lighting = game:GetService("Lighting")
 
 local LP = Players.LocalPlayer
 local Char = LP.Character or LP.CharacterAdded:Wait()
@@ -26,16 +31,45 @@ local Cam = Workspace.CurrentCamera
 local CFG = {
 	BOSS_USERID = nil, -- set a UserId (number) to build the boss from that avatar instead of yours
 	PLAYER_HP = 100,
+	HEAL_ON_CLEAR = 15, -- HP restored when a phase is cleared (set 0 for pure hell)
 	SWORD_DAMAGE = 35,
 	SWORD_COOLDOWN = 0.45,
-	BOSS_HP = { 400, 500, 550, 600, 800 },
+	BOSS_HP = { 450, 600, 700, 850, 1100 },
 	HOVER_HEIGHT = 45,
 	DASH_COOLDOWN = 1,
 	DASH_IFRAMES = 0.35,
 	DASH_SPEED = 85,
-	GEMS_NEEDED = 3,
-	STUN_TIME = 4,
+	GEMS_NEEDED = { [3] = 3, [4] = 4, [5] = 5 },
+	STUN_TIME = { [3] = 4.5, [4] = 4, [5] = 3.5 },
 	INVERT_TIME = 2.0,
+	INVERT_COUNT = { 0, 1, 2, 3, 4 }, -- how many 2s control inversions per phase
+
+	-- boss movement / attacks (index = phase)
+	CHASE_SPEED = { 24, 32 },
+	ORBIT_SPEED = { [3] = 34, [4] = 40, [5] = 48 },
+	FLOAT_WAIT = { [3] = 2.2, [4] = 1.7, [5] = 1.2 },
+
+	-- tentacles (everywhere on the map)
+	TENT_CAP = { 0, 16, 24, 32, 40 },
+	TENT_INTERVAL = { 99, 0.5, 0.33, 0.2, 0.12 }, -- seconds between spawns
+	TENT_RANGE = 260, -- max spawn distance from you
+	TENT_DMG = { 0, 8, 10, 12, 14 }, -- touch damage per second
+	TENT_STRIKE = { 0, 14, 18, 22, 26 }, -- lash damage
+	TENT_GEM = { 0, 0.5, 1, 0.6, 0.4 }, -- gem drop chance when sliced
+
+	-- legged environment crawlers (made from real map models)
+	MON_CAP = { 0, 0, 6, 18, 28 },
+	MON_INTERVAL = { 99, 99, 2.0, 0.8, 0.5 },
+	MON_SPEED = { 0, 0, 11, 13, 16 },
+	MON_DMG = { 0, 0, 8, 10, 13 },
+	MON_GEM = { 0, 0, 0.8, 0.7, 0.55 },
+
+	-- permanent environment corruption
+	CORRUPT_INTERVAL = { 99, 3.0, 1.2, 0.7, 0.35 },
+	CORRUPT_BATCH = { 0, 5, 10, 18, 28 },
+	FLESH_CHANCE = { 0, 0.9, 0.3, 0.5, 0.65 },
+	MAX_CORRUPT = 8000,
+
 	SWORD_BTN_POS = UDim2.new(0.45, 0, 0.05, 0),
 	DASH_BTN_POS = UDim2.new(0.45, 0, 0.55, 0),
 }
@@ -43,6 +77,7 @@ local CFG = {
 local PHASE_NAMES = { "ARACHNID DUEL", "FLESH GARDEN", "GLITCHED REALITY", "LEGGED NIGHTMARES", "TOTAL CLIMAX" }
 local LEG = 8.5
 local BODY_H = 9
+local TSEG = 6 -- tentacle segments
 
 ---------------------------------------------------------------- STATE
 local running, dead, cleaned = true, false, false
@@ -56,12 +91,13 @@ local playerHP = CFG.PLAYER_HP
 local invulnUntil, invertUntil = 0, 0
 local phase, gemCount = 0, 0
 local tentacles, monsters, gems, corrupted, hiddenModels = {}, {}, {}, {}, {}
+local corruptN, breathing, eyes, frameN, tentId = 0, 0, {}, 0, 0
 local legs = {}
 local B = {
 	hp = 1, maxhp = 1, pos = Root.Position, gy = Root.Position.Y - 3, yaw = 0,
 	height = -8, heightTarget = BODY_H, hRate = 6, mode = "idle", speed = 0, orbit = 0,
 	shielded = false, stunned = false, paused = true, dead = false,
-	cf = CFrame.new(Root.Position),
+	cf = CFrame.new(Root.Position), rage = 1, cycle = 0,
 }
 
 local RAYP = RaycastParams.new()
@@ -76,6 +112,14 @@ local function mk(class, props, parent)
 	for k, v in pairs(props) do o[k] = v end
 	o.Parent = parent
 	return o
+end
+
+local function needGems() return CFG.GEMS_NEEDED[phase] or 3 end
+
+local warned2 = false
+local function safe(f, ...)
+	local ok, e = pcall(f, ...)
+	if not ok and not warned2 then warned2 = true warn("[NightmareBoss] " .. tostring(e)) end
 end
 
 ---------------------------------------------------------------- UI
@@ -134,7 +178,7 @@ local function updateUI()
 	local tag = B.shielded and "  [SHIELDED]" or (B.stunned and "  [STUNNED]" or "")
 	bossLabel.Text = string.format("THE NIGHTMARE - PHASE %d/5: %s%s", math.max(phase, 1), PHASE_NAMES[math.max(phase, 1)], tag)
 	playerFill.Size = UDim2.new(math.clamp(playerHP / CFG.PLAYER_HP, 0, 1), 0, 1, 0)
-	gemLabel.Text = string.format("GEMS %d/%d", gemCount, CFG.GEMS_NEEDED)
+	gemLabel.Text = phase >= 3 and string.format("GEMS %d/%d", gemCount, needGems()) or ""
 end
 
 local lastHurtFx = 0
@@ -150,51 +194,104 @@ local function hurt(n)
 	if playerHP <= 0 then onPlayerDeath() end
 end
 
+---------------------------------------------------------------- MOOD (lighting)
+local cc = mk("ColorCorrectionEffect", { Name = "NB_CC" }, Lighting)
+local origFog = { Lighting.FogColor, Lighting.FogStart, Lighting.FogEnd }
+local MOODS = {
+	{ tint = Color3.fromRGB(255, 255, 255), sat = 0, con = 0 },
+	{ tint = Color3.fromRGB(255, 235, 235), sat = -0.1, con = 0.05 },
+	{ tint = Color3.fromRGB(255, 205, 215), sat = -0.2, con = 0.1, fog = 1200, fogCol = Color3.fromRGB(40, 0, 10) },
+	{ tint = Color3.fromRGB(255, 170, 180), sat = -0.3, con = 0.15, fog = 700, fogCol = Color3.fromRGB(45, 0, 12) },
+	{ tint = Color3.fromRGB(255, 130, 150), sat = -0.4, con = 0.2, fog = 450, fogCol = Color3.fromRGB(55, 0, 15) },
+}
+local function setMood(n)
+	local m = MOODS[n]
+	if not m then return end
+	TweenService:Create(cc, TweenInfo.new(2), { TintColor = m.tint, Saturation = m.sat, Contrast = m.con }):Play()
+	if m.fog then
+		TweenService:Create(Lighting, TweenInfo.new(3), { FogColor = m.fogCol, FogStart = 0, FogEnd = m.fog }):Play()
+	end
+end
+
 ---------------------------------------------------------------- WORLD HELPERS
 local function groundAt(x, z, ref)
 	local r = Workspace:Raycast(Vector3.new(x, ref + 8, z), Vector3.new(0, -150, 0), RAYP)
 	return r and r.Position.Y or ref
 end
 
-local cache, cacheT, refreshing = {}, -100, false
+local function groundTop(x, z)
+	local r = Workspace:Raycast(Vector3.new(x, Root.Position.Y + 120, z), Vector3.new(0, -400, 0), RAYP)
+	return r and r.Position or nil
+end
+
+local cache, partCache, cacheT, refreshing = {}, {}, -100, false
 local function refreshCache()
 	if refreshing or os.clock() - cacheT < 10 then return end
 	refreshing = true
 	task.spawn(function()
-		local out, n = {}, 0
+		local out, parts, n = {}, {}, 0
 		for _, m in ipairs(Workspace:GetDescendants()) do
 			n += 1
 			if n % 500 == 0 then task.wait() end
-			if m:IsA("Model") and m ~= Char and not m:IsDescendantOf(folder) and not m:IsDescendantOf(Char)
-				and not m:IsDescendantOf(Cam) and not m:FindFirstChildWhichIsA("Humanoid")
-				and m:FindFirstChildWhichIsA("BasePart") and not m.Name:lower():find("baseplate") then
-				out[#out + 1] = m
+			if not running then break end
+			if m:IsA("Model") then
+				if m ~= Char and not m:IsDescendantOf(folder) and not m:IsDescendantOf(Char)
+					and not m:IsDescendantOf(Cam) and not m:FindFirstChildWhichIsA("Humanoid")
+					and m:FindFirstChildWhichIsA("BasePart") and not m.Name:lower():find("baseplate") then
+					out[#out + 1] = m
+				end
+			elseif m:IsA("BasePart") and not m:IsA("Terrain") and #parts < 30000 then
+				if not corrupted[m] and not m:IsDescendantOf(folder) and not m:IsDescendantOf(Char)
+					and not m:IsDescendantOf(Cam) and not m.Name:lower():find("baseplate") and m.Size.Magnitude < 200 then
+					parts[#parts + 1] = m
+				end
 			end
 		end
-		cache, cacheT, refreshing = out, os.clock(), false
+		cache, partCache, cacheT, refreshing = out, parts, os.clock(), false
 	end)
 end
 
+local function isGone(m)
+	local a = m
+	while a and a ~= Workspace do
+		if hiddenModels[a] then return true end
+		a = a.Parent
+	end
+	return false
+end
+
 -- Only Model instances in Workspace; never the player character, never anything under the player's feet
-local function pickModel(maxExt)
+local function pickModel(maxExt, minD, maxD)
 	refreshCache()
 	if #cache == 0 then return nil end
 	local fr = Workspace:Raycast(Root.Position, Vector3.new(0, -15, 0), RAYP)
 	local floorPart = fr and fr.Instance
-	for _ = 1, 12 do
+	local pp = Root.Position
+	for _ = 1, 25 do
 		local m = cache[rng:NextInteger(1, #cache)]
-		if m and m.Parent and not hiddenModels[m] and not (floorPart and floorPart:IsDescendantOf(m)) then
+		if m and m.Parent and not isGone(m) and not (floorPart and floorPart:IsDescendantOf(m)) then
 			local ok, sz = pcall(function() return m:GetExtentsSize() end)
-			if ok and math.max(sz.X, sz.Y, sz.Z) <= maxExt then return m end
+			if ok and math.max(sz.X, sz.Y, sz.Z) <= maxExt then
+				local okp, piv = pcall(function() return m:GetPivot().Position end)
+				if okp then
+					local d = (piv - pp).Magnitude
+					if d >= (minD or 0) and d <= (maxD or 1e9) then return m, piv end
+				end
+			end
 		end
 	end
 	return nil
 end
 
-local function setHidden(m, v)
-	hiddenModels[m] = v or nil
+-- PERMANENT: the original object is gone for good (no restore, no regeneration)
+local function consume(m)
+	hiddenModels[m] = true
 	for _, d in ipairs(m:GetDescendants()) do
-		if d:IsA("BasePart") then d.LocalTransparencyModifier = v and 1 or 0 end
+		if d:IsA("BasePart") then
+			d.Anchored = true
+			d.CanCollide, d.CanTouch = false, false
+			d.LocalTransparencyModifier = 1
+		end
 	end
 end
 
@@ -206,6 +303,106 @@ local function ring(center, radius, dur, color)
 	}, folder)
 	TweenService:Create(p, TweenInfo.new(dur, Enum.EasingStyle.Linear), { Size = Vector3.new(0.4, radius * 2, radius * 2) }):Play()
 	Debris:AddItem(p, dur + 0.15)
+end
+
+---------------------------------------------------------------- PERMANENT ENVIRONMENT CORRUPTION
+local FLESH = {
+	Color3.fromRGB(150, 45, 55), Color3.fromRGB(120, 30, 42), Color3.fromRGB(178, 82, 78),
+	Color3.fromRGB(92, 22, 34), Color3.fromRGB(205, 120, 110), Color3.fromRGB(130, 20, 30),
+}
+
+local function stripLook(p)
+	for _, c in ipairs(p:GetChildren()) do
+		if c:IsA("SurfaceAppearance") or c:IsA("Texture") or c:IsA("Decal") then c:Destroy() end
+	end
+	if p:IsA("MeshPart") then pcall(function() p.TextureID = "" end) end
+end
+
+local function placeEye(p)
+	if #eyes >= 36 then return end
+	local ox = rng:NextNumber(-0.3, 0.3) * p.Size.X
+	local oz = rng:NextNumber(-0.3, 0.3) * p.Size.Z
+	local c = p.CFrame:PointToWorldSpace(Vector3.new(ox, p.Size.Y / 2, oz))
+	local r = rng:NextNumber(1.2, 3)
+	local white = mk("Part", { Shape = Enum.PartType.Ball, Size = Vector3.new(r * 2, r * 2, r * 2), Color = Color3.fromRGB(240, 232, 222), Material = Enum.Material.SmoothPlastic, Anchored = true, CanCollide = false, CanTouch = false, CanQuery = false, CastShadow = false, Position = c }, folder)
+	local pupil = mk("Part", { Shape = Enum.PartType.Ball, Size = Vector3.new(r * 0.7, r * 0.7, r * 0.7), Color = Color3.fromRGB(12, 0, 0), Material = Enum.Material.SmoothPlastic, Anchored = true, CanCollide = false, CanTouch = false, CanQuery = false, CastShadow = false, Position = c }, folder)
+	eyes[#eyes + 1] = { c = c, r = r, w = white, p = pupil }
+end
+
+local function fleshify(p, instant, extras)
+	stripLook(p)
+	local col = FLESH[rng:NextInteger(1, #FLESH)]
+	if rng:NextNumber() < 0.7 then
+		p.Material = Enum.Material.Fabric
+	else
+		p.Material = Enum.Material.SmoothPlastic
+		p.Reflectance = 0.12
+	end
+	if instant then
+		p.Color = col
+	else
+		TweenService:Create(p, TweenInfo.new(rng:NextNumber(0.8, 2)), { Color = col }):Play()
+	end
+	if extras then
+		if breathing < 150 and rng:NextNumber() < 0.35 then -- living, breathing walls
+			breathing += 1
+			local s = p.Size
+			TweenService:Create(p, TweenInfo.new(rng:NextNumber(0.9, 1.6), Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true), {
+				Size = s * rng:NextNumber(1.04, 1.1),
+			}):Play()
+		end
+		if phase >= 4 and rng:NextNumber() < 0.1 then placeEye(p) end
+	end
+end
+
+local function corruptPart(p, forceFlesh)
+	corrupted[p] = true
+	corruptN += 1
+	local floorish = (p.Position.Y + p.Size.Y / 2) < B.gy + 4 or (p.Size.X > 80 and p.Size.Z > 80)
+	local fc = CFG.FLESH_CHANCE[math.max(phase, 1)] or 0.4
+	if forceFlesh or floorish or rng:NextNumber() < fc then -- floors only ever turn to flesh (never collapse under you)
+		fleshify(p, false, true)
+		return
+	end
+	local mode = rng:NextInteger(1, 3)
+	if mode == 1 then -- stretch (permanent)
+		local s = p.Size
+		TweenService:Create(p, TweenInfo.new(1.6, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), {
+			Size = Vector3.new(s.X * rng:NextNumber(0.5, 1.6), s.Y * rng:NextNumber(2, 4), s.Z * rng:NextNumber(0.5, 1.6)),
+		}):Play()
+	elseif mode == 2 then -- dissolve (permanent)
+		TweenService:Create(p, TweenInfo.new(4, Enum.EasingStyle.Sine), { Transparency = 1 }):Play()
+		task.delay(4, function() if p.Parent then p.CanCollide = false end end)
+	elseif p.Anchored then -- levitate + twist (permanent)
+		p.CanCollide = false
+		TweenService:Create(p, TweenInfo.new(rng:NextNumber(2.5, 4), Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), {
+			CFrame = p.CFrame * CFrame.Angles(rng:NextNumber(-0.5, 0.5), rng:NextNumber(-1, 1), rng:NextNumber(-0.5, 0.5)) + Vector3.new(0, rng:NextNumber(6, 22), 0),
+		}):Play()
+	else
+		fleshify(p, false, true)
+	end
+end
+
+-- corrupt n random map parts (optionally only around `center` within `radius`); nothing is ever restored
+local function corruptBatch(n, center, radius, forceFlesh)
+	refreshCache()
+	if #partCache == 0 or corruptN >= CFG.MAX_CORRUPT then return end
+	local pp = Root.Position
+	local c = center or pp
+	local rad = radius or 320
+	local done, tries, maxTries = 0, 0, n * (rad < 100 and 60 or 12)
+	while done < n and tries < maxTries do
+		tries += 1
+		local p = partCache[rng:NextInteger(1, #partCache)]
+		if p and p.Parent and not corrupted[p] and p.Transparency < 1 and p.LocalTransparencyModifier < 1
+			and (p.Position - c).Magnitude <= rad and (p.Position - pp).Magnitude > 8 then
+			local am = p:FindFirstAncestorOfClass("Model")
+			if not (am and am:FindFirstChildOfClass("Humanoid")) and not p:IsDescendantOf(folder) then
+				corruptPart(p, forceFlesh)
+				done += 1
+			end
+		end
+	end
 end
 
 ---------------------------------------------------------------- GEMS + SHIELD
@@ -237,12 +434,13 @@ function breakShield()
 		TweenService:Create(sh, TweenInfo.new(0.4), { Transparency = 1, Size = sh.Size * 1.4 }):Play()
 		Debris:AddItem(sh, 0.5)
 	end
+	local stun = CFG.STUN_TIME[phase] or 4
 	flash(Color3.fromRGB(120, 255, 255), 0.3, 0.5)
 	shake(2, 0.6)
-	say("SHIELD BROKEN - SLASH HIM!", CFG.STUN_TIME)
+	say("SHIELD BROKEN - SLASH HIM!", stun)
 	updateUI()
 	local myPhase = phase
-	task.delay(CFG.STUN_TIME, function()
+	task.delay(stun, function()
 		if not running or B.dead or phase ~= myPhase or B.paused then return end
 		B.stunned, B.shielded = false, true
 		B.heightTarget, B.hRate, B.mode = CFG.HOVER_HEIGHT, 2, "orbit"
@@ -252,16 +450,17 @@ function breakShield()
 end
 
 function launchGems()
+	local need = needGems()
 	gemCount = 0
 	updateUI()
 	local arrived = 0
-	for i = 1, CFG.GEMS_NEEDED do
+	for i = 1, need do
 		local g = mk("Part", {
 			Shape = Enum.PartType.Ball, Size = Vector3.new(2, 2, 2), Color = Color3.fromRGB(80, 255, 255),
 			Material = Enum.Material.Neon, Anchored = true, CanCollide = false, CanTouch = false, CanQuery = false,
 			Position = Root.Position + Vector3.new(0, 2, 0),
 		}, folder)
-		local ang = i * 2 * math.pi / CFG.GEMS_NEEDED
+		local ang = i * 2 * math.pi / need
 		local side = Vector3.new(math.cos(ang), 1, math.sin(ang)).Unit
 		task.spawn(function()
 			local t0 = os.clock()
@@ -278,16 +477,16 @@ function launchGems()
 			end
 			g:Destroy()
 			arrived += 1
-			if arrived >= CFG.GEMS_NEEDED then breakShield() end
+			if arrived >= need then breakShield() end
 		end)
 	end
 end
 
 local function collectGem()
-	if phase >= 3 and B.shielded and not B.stunned and gemCount < CFG.GEMS_NEEDED then
+	if phase >= 3 and B.shielded and not B.stunned and gemCount < needGems() then
 		gemCount += 1
 		updateUI()
-		if gemCount >= CFG.GEMS_NEEDED then launchGems() end
+		if gemCount >= needGems() then launchGems() end
 	else
 		playerHP = math.min(CFG.PLAYER_HP, playerHP + 6) -- spare gems heal a little
 		updateUI()
@@ -411,7 +610,7 @@ local function bossStep(dt)
 		if B.mode == "chase" then
 			target = pp
 		elseif B.mode == "orbit" then
-			B.orbit += dt * 0.5
+			B.orbit += dt * 0.5 * B.rage
 			target = Vector3.new(pp.X + math.cos(B.orbit) * 26, 0, pp.Z + math.sin(B.orbit) * 26)
 		end
 		if target then
@@ -438,113 +637,133 @@ local function bossStep(dt)
 	updateLegs(dt, body, yawCF)
 end
 
----------------------------------------------------------------- BOSS ATTACKS
-local function slam()
-	B.mode, B.heightTarget, B.hRate = "idle", 16, 3
-	local center = Vector3.new(B.pos.X, B.gy, B.pos.Z)
-	local R = 24
-	local warnDisc = mk("Part", {
-		Anchored = true, CanCollide = false, CanTouch = false, CanQuery = false, Shape = Enum.PartType.Cylinder,
-		Size = Vector3.new(0.2, R * 2, R * 2), Color = Color3.fromRGB(255, 40, 40), Material = Enum.Material.Neon,
-		Transparency = 0.8, CFrame = CFrame.new(center + Vector3.new(0, 0.25, 0)) * CFrame.Angles(0, 0, math.pi / 2),
-	}, folder)
-	Debris:AddItem(warnDisc, 1.6)
-	ring(center, R, 1.4, Color3.fromRGB(255, 40, 40))
-	task.wait(1.4)
-	if not running or B.dead then return end
-	B.hRate, B.heightTarget = 30, BODY_H
-	task.wait(0.12)
-	shake(1.2, 0.5)
-	ring(center, R + 6, 0.5, Color3.fromRGB(255, 150, 40))
-	local pp = Root.Position
-	local flat = Vector3.new(pp.X - center.X, 0, pp.Z - center.Z).Magnitude
-	if flat < R and pp.Y - center.Y < 6.5 then hurt(30) end -- jump or dash to dodge
-	B.hRate = 6
-	task.wait(1.1)
-end
+---------------------------------------------------------------- HAZARDS: TENTACLES (realistic, segmented, everywhere)
+local function segDia(i) return 3.4 - (i - 1) * (2.6 / (TSEG - 1)) end
 
-local function fireOrb(spread)
-	local start = B.cf.Position
-	local dir = (Root.Position - start).Unit
-	dir = (CFrame.lookAt(Vector3.zero, dir) * CFrame.Angles(0, spread, 0)).LookVector
-	local p = mk("Part", {
-		Shape = Enum.PartType.Ball, Size = Vector3.new(3.5, 3.5, 3.5), Color = Color3.fromRGB(190, 60, 255),
-		Material = Enum.Material.Neon, Anchored = true, CanCollide = false, CanTouch = false, CanQuery = false, Position = start,
-	}, folder)
-	task.spawn(function()
-		local t0 = os.clock()
-		while running and p.Parent and os.clock() - t0 < 6 do
-			local dt = RunService.Heartbeat:Wait()
-			p.Position += dir * 55 * dt
-			if (p.Position - Root.Position).Magnitude < 4 then hurt(14) break end
-		end
-		p:Destroy()
-	end)
-end
-
-local function groundCycle()
-	B.mode, B.speed = "chase", (phase == 1) and 22 or 18
-	local t0 = os.clock()
-	while running and not B.dead and os.clock() - t0 < 4 do
+local function spawnTentacle(atPos)
+	local pos = atPos
+	local quick = atPos ~= nil
+	if not pos then
 		local pp = Root.Position
-		if Vector3.new(pp.X - B.pos.X, 0, pp.Z - B.pos.Z).Magnitude < 20 and os.clock() - t0 > 1.2 then break end
-		task.wait(0.1)
+		for _ = 1, 5 do
+			local ang = rng:NextNumber(0, math.pi * 2)
+			local dist = (rng:NextNumber() < 0.4) and rng:NextNumber(12, 45) or rng:NextNumber(45, CFG.TENT_RANGE)
+			local x, z = pp.X + math.cos(ang) * dist, pp.Z + math.sin(ang) * dist
+			local r = Workspace:Raycast(Vector3.new(x, pp.Y + 120, z), Vector3.new(0, -400, 0), RAYP)
+			if r and r.Normal.Y > 0.4 then pos = r.Position break end
+		end
 	end
-	if B.paused or B.stunned or B.dead then return end
-	slam()
+	if not pos then return end
+
+	local col0 = Color3.fromRGB(rng:NextInteger(95, 130), rng:NextInteger(18, 32), rng:NextInteger(30, 45))
+	local col1 = Color3.fromRGB(rng:NextInteger(190, 225), rng:NextInteger(70, 100), rng:NextInteger(80, 105))
+	local segs = {}
+	for i = 1, TSEG do
+		segs[i] = mk("Part", {
+			Shape = Enum.PartType.Cylinder, Anchored = true, CanCollide = false, CanTouch = false, CanQuery = false,
+			Material = Enum.Material.SmoothPlastic, Reflectance = 0.08, CastShadow = false,
+			Color = col0:Lerp(col1, (i - 1) / (TSEG - 1)), Size = Vector3.new(1, 1, 1), Position = pos,
+		}, folder)
+	end
+	local tip = mk("Part", {
+		Shape = Enum.PartType.Ball, Anchored = true, CanCollide = false, CanTouch = false, CanQuery = false, CastShadow = false,
+		Material = Enum.Material.Neon, Color = Color3.fromRGB(255, 70, 90), Size = Vector3.new(1.5, 1.5, 1.5), Position = pos,
+	}, folder)
+	local disc = mk("Part", {
+		Shape = Enum.PartType.Cylinder, Anchored = true, CanCollide = false, CanTouch = false, CanQuery = false, CastShadow = false,
+		Material = Enum.Material.Fabric, Color = Color3.fromRGB(85, 14, 24), Size = Vector3.new(0.5, 9, 9),
+		CFrame = CFrame.new(pos + Vector3.new(0, 0.15, 0)) * CFrame.Angles(0, 0, math.pi / 2),
+	}, folder)
+	ring(pos, 7, 0.7, Color3.fromRGB(255, 40, 60))
+
+	local pts = {}
+	for k = 1, TSEG + 1 do pts[k] = pos end
+	tentId += 1
+	local now = os.clock()
+	tentacles[#tentacles + 1] = {
+		segs = segs, tip = tip, disc = disc, base = pos, pts = pts, id = tentId,
+		h = 0.6, target = rng:NextNumber(16, 30) + math.max(phase, 1) * 2, seed = rng:NextNumber(0, 10),
+		growAt = now + (quick and 0.2 or 0.6), nextStrike = now + 1.8 + rng:NextNumber(0, 2),
+		strikeAt = -10, hit = true, lastSeg = -1,
+	}
 end
 
-local function floatCycle()
-	B.mode, B.speed = "orbit", 30
-	task.wait(rng:NextNumber(2.5, 4))
-	if B.stunned or B.paused or B.dead or not running then return end
-	if phase == 5 then
-		for _, s in ipairs({ -0.25, 0, 0.25 }) do fireOrb(s) end
-	else
-		fireOrb(0)
-	end
-end
-
----------------------------------------------------------------- HAZARDS
-local function spawnTentacle()
-	local ang, dist = rng:NextNumber(0, math.pi * 2), rng:NextNumber(10, 28)
-	local pp = Root.Position
-	local x, z = pp.X + math.cos(ang) * dist, pp.Z + math.sin(ang) * dist
-	local part = mk("Part", { Anchored = true, CanCollide = false, CanTouch = false, Color = Color3.fromRGB(150, 40, 60), Material = Enum.Material.Fabric, Size = Vector3.new(2.5, 0.2, 2.5) }, folder)
-	local tip = mk("Part", { Shape = Enum.PartType.Ball, Anchored = true, CanCollide = false, CanTouch = false, Color = Color3.fromRGB(200, 30, 60), Material = Enum.Material.Neon, Size = Vector3.new(4, 4, 4) }, folder)
-	tentacles[#tentacles + 1] = { part = part, tip = tip, base = Vector3.new(x, groundAt(x, z, B.gy), z), h = 0.2, seed = rng:NextNumber(0, 10) }
+local function destroyTentacle(t)
+	for _, s in ipairs(t.segs) do s:Destroy() end
+	t.tip:Destroy()
+	t.disc:Destroy()
 end
 
 local function killTentacle(i)
 	local t = table.remove(tentacles, i)
-	spawnGem(t.base + Vector3.new(0, 3, 0))
-	t.part:Destroy()
-	t.tip:Destroy()
+	if rng:NextNumber() < (CFG.TENT_GEM[math.max(phase, 1)] or 0.5) then
+		spawnGem(t.base + Vector3.new(0, 3, 0))
+	end
+	ring(t.base, 6, 0.4, Color3.fromRGB(200, 40, 60))
+	destroyTentacle(t)
+end
+
+local function pruneFarTentacle()
+	local pp = Root.Position
+	local worst, wi = 0, nil
+	for i, t in ipairs(tentacles) do
+		local d = (t.base - pp).Magnitude
+		if d > worst then worst, wi = d, i end
+	end
+	if wi and worst > 190 then destroyTentacle(table.remove(tentacles, wi)) end
+end
+
+---------------------------------------------------------------- HAZARDS: LEGGED CRAWLERS (the environment comes alive)
+local function buildCrawler()
+	local mdl = Instance.new("Model")
+	local sz = rng:NextNumber(3, 6)
+	local body = mk("Part", {
+		Name = "Body", Shape = Enum.PartType.Ball, Size = Vector3.new(sz, sz, sz),
+		Color = FLESH[rng:NextInteger(1, #FLESH)], Material = Enum.Material.Fabric, CFrame = CFrame.new(0, 0, 0),
+	}, mdl)
+	for _, sx in ipairs({ -1, 1 }) do
+		mk("Part", {
+			Shape = Enum.PartType.Ball, Size = Vector3.new(sz * 0.3, sz * 0.3, sz * 0.3), Color = Color3.fromRGB(255, 255, 230),
+			Material = Enum.Material.Neon, CFrame = body.CFrame * CFrame.new(sx * sz * 0.22, sz * 0.12, -sz * 0.42),
+		}, mdl)
+	end
+	mdl.PrimaryPart = body
+	return mdl
 end
 
 local function spawnMonster()
-	local src = pickModel(60)
-	if not src then return end
-	local ok, m = pcall(function() return src:Clone() end)
-	if not ok or not m then return end
+	local src, sp = pickModel(60, 12, 320)
+	local m, pos
+	if src then
+		local ok, c = pcall(function() return src:Clone() end)
+		if ok and c then m, pos = c, sp + Vector3.new(0, 4, 0) end
+	end
+	if not m then
+		src = nil
+		m = buildCrawler()
+		local pp = Root.Position
+		local ang, dist = rng:NextNumber(0, math.pi * 2), rng:NextNumber(40, 110)
+		local gp = groundTop(pp.X + math.cos(ang) * dist, pp.Z + math.sin(ang) * dist)
+		if not gp then m:Destroy() return end
+		pos = gp + Vector3.new(0, 6, 0)
+	end
 	local parts = {}
 	for _, d in ipairs(m:GetDescendants()) do
 		if d:IsA("LuaSourceContainer") then d:Destroy()
 		elseif d:IsA("BasePart") then parts[#parts + 1] = d end
 	end
-	if #parts == 0 or #parts > 80 then m:Destroy() return end
+	if #parts == 0 or #parts > 60 then m:Destroy() return end
 	m.Parent = folder
 	local ext = m:GetExtentsSize()
 	local mx = math.max(ext.X, ext.Y, ext.Z)
 	pcall(function() m:ScaleTo(m:GetScale() * (mx > 10 and 10 / mx or (mx < 3 and 3 / mx or 1))) end)
-
-	local ang, dist = rng:NextNumber(0, math.pi * 2), rng:NextNumber(35, 50)
-	local pp = Root.Position
-	local x, z = pp.X + math.cos(ang) * dist, pp.Z + math.sin(ang) * dist
-	m:PivotTo(CFrame.new(x, groundAt(x, z, B.gy) + 10, z))
+	m:PivotTo(CFrame.new(pos))
 
 	local pr = m.PrimaryPart or parts[1]
 	local cf, size = m:GetBoundingBox()
+	if src and phase >= 4 and rng:NextNumber() < 0.6 then -- some of them are already flesh
+		for _, p in ipairs(parts) do fleshify(p, true, false) end
+	end
 	for _, p in ipairs(parts) do
 		p.Anchored, p.CanCollide, p.Massless, p.CanTouch = false, p == pr, p ~= pr, false
 		if p ~= pr then
@@ -570,8 +789,11 @@ local function spawnMonster()
 		w.Parent = leg
 		lw[i] = { w = w, c0 = c0, ph = i * 1.7 }
 	end
-	setHidden(src, true) -- the original model "becomes" the monster
-	monsters[#monsters + 1] = { m = m, pr = pr, welds = lw, hits = 0, src = src, hitCd = 0, radius = math.max(size.X, size.Z) / 2 }
+	if src then consume(src) end -- the original object "becomes" the monster and never comes back
+	monsters[#monsters + 1] = {
+		m = m, pr = pr, welds = lw, hits = 0, src = src, hitCd = 0, jumpAt = 0,
+		radius = math.max(size.X, size.Z) / 2, speed = (CFG.MON_SPEED[math.max(phase, 1)] or 12) * rng:NextNumber(0.85, 1.2),
+	}
 end
 
 local function killMonster(i, giveGem)
@@ -581,82 +803,109 @@ local function killMonster(i, giveGem)
 		if pos.Y < B.gy - 50 then pos = Root.Position + Vector3.new(6, 0, 0) end
 		spawnGem(pos + Vector3.new(0, 2, 0))
 	end
-	pcall(setHidden, mo.src, false)
-	mo.m:Destroy()
-end
-
-local function corruptRandom()
-	local m = pickModel(150)
-	if not m then return end
-	local parts = {}
-	for _, p in ipairs(m:GetDescendants()) do
-		if p:IsA("BasePart") and not corrupted[p] and not p:IsDescendantOf(folder) and not p.Name:lower():find("baseplate") and p.Size.Magnitude < 150 then
-			parts[#parts + 1] = p
-			if #parts >= 25 then break end
-		end
-	end
-	if #parts == 0 then return end
-	local mode = rng:NextInteger(1, 2)
-	for _, p in ipairs(parts) do
-		corrupted[p] = { Size = p.Size, Transparency = p.Transparency, CanCollide = p.CanCollide }
-		if mode == 1 then -- stretch
-			local s = p.Size
-			p.CanCollide = false
-			TweenService:Create(p, TweenInfo.new(1.6, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), {
-				Size = Vector3.new(s.X * rng:NextNumber(0.5, 1.6), s.Y * rng:NextNumber(2, 4), s.Z * rng:NextNumber(0.5, 1.6)),
-			}):Play()
-		else -- dissolve
-			TweenService:Create(p, TweenInfo.new(4, Enum.EasingStyle.Sine), { Transparency = 1 }):Play()
-		end
-	end
-end
-
-local function restoreCorruption(instant)
-	local snap = corrupted
-	corrupted = {}
-	for p, d in pairs(snap) do
-		if p.Parent then
-			if instant then
-				p.Size, p.Transparency, p.CanCollide = d.Size, d.Transparency, d.CanCollide
-			else
-				TweenService:Create(p, TweenInfo.new(1.5), { Size = d.Size, Transparency = d.Transparency }):Play()
-				task.delay(1.6, function()
-					if p.Parent then p.Size, p.Transparency, p.CanCollide = d.Size, d.Transparency, d.CanCollide end
-				end)
-			end
-		end
-	end
+	mo.m:Destroy() -- source stays gone: permanent
 end
 
 local function clearHazards()
 	for i = #tentacles, 1, -1 do
-		local t = table.remove(tentacles, i)
-		t.part:Destroy()
-		t.tip:Destroy()
+		destroyTentacle(table.remove(tentacles, i))
 	end
 	for i = #monsters, 1, -1 do
-		local mo = table.remove(monsters, i)
-		pcall(setHidden, mo.src, false)
-		mo.m:Destroy()
+		table.remove(monsters, i).m:Destroy()
 	end
 	for i = #gems, 1, -1 do
 		table.remove(gems, i).part:Destroy()
 	end
 end
 
+local tParts, tCFs = {}, {}
+local function bulk(parts, cfs)
+	local ok = pcall(Workspace.BulkMoveTo, Workspace, parts, cfs, Enum.BulkMoveMode.FireCFrameChanged)
+	if not ok then
+		for i, p in ipairs(parts) do p.CFrame = cfs[i] end
+	end
+end
+
 local function hazardStep(dt)
+	frameN += 1
 	local now = os.clock()
 	local pp = Root.Position
+	local ph = math.max(phase, 1)
+	local acc = 0
+
+	-- tentacles
+	table.clear(tParts)
+	table.clear(tCFs)
 	for _, t in ipairs(tentacles) do
-		t.h = math.min(14, t.h + 22 * dt)
-		local sway = CFrame.Angles(math.sin(now * 2 + t.seed) * 0.15, 0, math.cos(now * 1.7 + t.seed) * 0.15)
-		local cf = CFrame.new(t.base) * sway * CFrame.new(0, t.h / 2, 0)
-		t.part.Size = Vector3.new(2.5, t.h, 2.5)
-		t.part.CFrame = cf
-		t.tip.CFrame = cf * CFrame.new(0, t.h / 2, 0)
-		local d = Vector3.new(pp.X - t.base.X, 0, pp.Z - t.base.Z).Magnitude
-		if t.h > 5 and d < 7 and pp.Y - t.base.Y < t.h then hurt(14 * dt) end -- continuous proximity damage
+		local base = t.base
+		local flatV = Vector3.new(pp.X - base.X, 0, pp.Z - base.Z)
+		local dflat = flatV.Magnitude
+		local far = dflat > 180
+		if far and (frameN + t.id) % 4 ~= 0 then continue end
+
+		if now >= t.growAt and t.h < t.target then
+			t.h = math.min(t.target, t.h + 24 * dt * (far and 4 or 1))
+		end
+		local seg = t.h / TSEG
+		if math.abs(seg - t.lastSeg) > 0.01 then
+			t.lastSeg = seg
+			local gk = math.clamp(t.h / 8, 0.25, 1)
+			for i = 1, TSEG do
+				local dia = segDia(i) * gk
+				t.segs[i].Size = Vector3.new(seg * 1.2, dia, dia)
+			end
+		end
+
+		local toP = (pp - base)
+		toP = toP.Magnitude > 0.1 and toP.Unit or Vector3.yAxis
+		local aggr = math.clamp(1 - dflat / 60, 0, 1) * 0.9 + 0.1
+		local striking = now - t.strikeAt < 0.5
+		if not striking and now > t.nextStrike and t.h >= t.target * 0.9 and dflat < t.h * 1.3 + 8 then
+			t.strikeAt, t.hit = now, false
+			t.nextStrike = now + rng:NextNumber(1.8, 3.6) / (1 + ph * 0.1)
+			striking = true
+		end
+		local lean = (striking and 2.2 or 0.55) * aggr
+
+		local pts = t.pts
+		pts[1] = base
+		local dir = Vector3.yAxis
+		local minHit = 1e9
+		for i = 1, TSEG do
+			local f = i / TSEG
+			local wob = Vector3.new(
+				math.sin(now * 1.7 + t.seed + i * 0.9),
+				math.sin(now * 1.1 + t.seed * 2 + i * 0.5) * 0.3,
+				math.cos(now * 1.4 + t.seed * 1.3 + i * 1.1)
+			) * 0.45 * f
+			dir = (dir + wob + toP * lean * f * 0.6 + Vector3.new(0, -0.12 * f, 0)).Unit
+			local b2 = pts[i] + dir * seg
+			pts[i + 1] = b2
+			if not far then
+				local a = pts[i]
+				local ab = b2 - a
+				local tt = math.clamp((pp - a):Dot(ab) / math.max(ab:Dot(ab), 0.001), 0, 1)
+				local d = (a + ab * tt - pp).Magnitude - (segDia(i) * 0.5 + 1.8)
+				if d < minHit then minHit = d end
+			end
+			local part = t.segs[i]
+			tParts[#tParts + 1] = part
+			tCFs[#tCFs + 1] = CFrame.lookAt((pts[i] + b2) / 2, b2) * CFrame.Angles(0, math.pi / 2, 0)
+		end
+		tParts[#tParts + 1] = t.tip
+		tCFs[#tCFs + 1] = CFrame.new(pts[TSEG + 1])
+
+		if not far and t.h > 4 then
+			if minHit < 0.4 then acc += (CFG.TENT_DMG[ph] or 8) * dt end -- continuous touch damage
+			if striking and not t.hit and minHit < 1.2 then
+				t.hit = true
+				acc += CFG.TENT_STRIKE[ph] or 14 -- lash
+			end
+		end
 	end
+	if #tParts > 0 then bulk(tParts, tCFs) end
+
+	-- crawlers
 	for i = #monsters, 1, -1 do
 		local mo = monsters[i]
 		if not mo.pr.Parent then
@@ -667,19 +916,26 @@ local function hazardStep(dt)
 			local mag = v.Magnitude
 			local dir = mag > 0.1 and v.Unit or Vector3.zero
 			local vel = mo.pr.AssemblyLinearVelocity
+			local sp = mo.speed * (mag > 70 and 2.4 or 1)
 			if now > mo.hitCd - 0.5 then
-				mo.pr.AssemblyLinearVelocity = Vector3.new(dir.X * 13, vel.Y, dir.Z * 13)
+				mo.pr.AssemblyLinearVelocity = Vector3.new(dir.X * sp, vel.Y, dir.Z * sp)
+				if now > mo.jumpAt and mag > 6 and Vector3.new(vel.X, 0, vel.Z).Magnitude < sp * 0.3 then
+					mo.jumpAt = now + 1.2 -- stuck on something: hop
+					mo.pr.AssemblyLinearVelocity = Vector3.new(dir.X * sp, 45, dir.Z * sp)
+				end
 			end
 			for _, l in ipairs(mo.welds) do
 				l.w.C0 = l.c0 * CFrame.Angles(math.sin(now * 9 + l.ph) * 0.6, 0, 0)
 			end
 			if mag < mo.radius + 4 and now > mo.hitCd and math.abs(pp.Y - mp.Y) < 10 then
 				mo.hitCd = now + 1
-				hurt(10)
+				acc += CFG.MON_DMG[ph] or 10
 			end
 			if mp.Y < B.gy - 100 then killMonster(i, true) end
 		end
 	end
+
+	-- gems
 	for i = #gems, 1, -1 do
 		local g = gems[i]
 		if not g.part.Parent or now - g.born > 45 then
@@ -692,6 +948,155 @@ local function hazardStep(dt)
 				table.remove(gems, i)
 				collectGem()
 			end
+		end
+	end
+
+	if acc > 0 then hurt(acc) end
+end
+
+local function eyeStep()
+	if frameN % 2 ~= 0 or #eyes == 0 then return end
+	local pp = Root.Position
+	local ps, cs = {}, {}
+	for _, e in ipairs(eyes) do
+		if e.p.Parent then
+			local v = pp - e.c
+			if v.Magnitude < 250 and v.Magnitude > 0.1 then
+				ps[#ps + 1] = e.p
+				cs[#cs + 1] = CFrame.new(e.c + v.Unit * e.r * 0.85)
+			end
+		end
+	end
+	if #ps > 0 then bulk(ps, cs) end
+end
+
+---------------------------------------------------------------- BOSS ATTACKS
+local function slam()
+	local ph = math.max(phase, 1)
+	local R = ({ 24, 30 })[ph] or 26
+	local wind = ({ 1.3, 1.0 })[ph] or 1.2
+	local dmg = ({ 30, 40 })[ph] or 35
+	B.mode, B.heightTarget, B.hRate = "idle", 16, 3
+	local center = Vector3.new(B.pos.X, B.gy, B.pos.Z)
+	local warnDisc = mk("Part", {
+		Anchored = true, CanCollide = false, CanTouch = false, CanQuery = false, Shape = Enum.PartType.Cylinder,
+		Size = Vector3.new(0.2, R * 2, R * 2), Color = Color3.fromRGB(255, 40, 40), Material = Enum.Material.Neon,
+		Transparency = 0.8, CFrame = CFrame.new(center + Vector3.new(0, 0.25, 0)) * CFrame.Angles(0, 0, math.pi / 2),
+	}, folder)
+	Debris:AddItem(warnDisc, wind + 0.2)
+	ring(center, R, wind, Color3.fromRGB(255, 40, 40))
+	task.wait(wind / B.rage)
+	if not running or B.dead then return end
+	B.hRate, B.heightTarget = 30, BODY_H
+	task.wait(0.12)
+	shake(1.2, 0.5)
+	ring(center, R + 6, 0.5, Color3.fromRGB(255, 150, 40))
+	local pp = Root.Position
+	local flat = Vector3.new(pp.X - center.X, 0, pp.Z - center.Z).Magnitude
+	if flat < R and pp.Y - center.Y < 6.5 then hurt(dmg) end -- jump or dash to dodge
+	if ph >= 2 then -- the impact rots the ground and sprouts tentacles
+		safe(corruptBatch, 14, center, R + 14, true)
+		for _ = 1, 3 do
+			local a = rng:NextNumber(0, math.pi * 2)
+			local gp = groundTop(center.X + math.cos(a) * (R + 4), center.Z + math.sin(a) * (R + 4))
+			if gp then safe(spawnTentacle, gp) end
+		end
+	end
+	B.hRate = 6
+	task.wait(1.1 / B.rage)
+end
+
+local function fireOrb(spread, speed, dmg)
+	local start = B.cf.Position
+	local dir = (Root.Position - start).Unit
+	dir = (CFrame.lookAt(Vector3.zero, dir) * CFrame.Angles(0, spread, 0)).LookVector
+	local p = mk("Part", {
+		Shape = Enum.PartType.Ball, Size = Vector3.new(3.5, 3.5, 3.5), Color = Color3.fromRGB(190, 60, 255),
+		Material = Enum.Material.Neon, Anchored = true, CanCollide = false, CanTouch = false, CanQuery = false, Position = start,
+	}, folder)
+	task.spawn(function()
+		local t0 = os.clock()
+		while running and p.Parent and os.clock() - t0 < 6 do
+			local dt = RunService.Heartbeat:Wait()
+			p.Position += dir * speed * dt
+			if (p.Position - Root.Position).Magnitude < 4 then hurt(dmg) break end
+		end
+		p:Destroy()
+	end)
+end
+
+-- boss marks the ground around you; after a beat it ERUPTS (damage + tentacle + rot)
+local function eruption(count, radius, dmg)
+	local spots = {}
+	local pp = Root.Position
+	local vel = Root.AssemblyLinearVelocity
+	for i = 1, count do
+		local off = (i == 1) and (Vector3.new(vel.X, 0, vel.Z) * 0.6) or Vector3.new(rng:NextNumber(-30, 30), 0, rng:NextNumber(-30, 30))
+		local x, z = pp.X + off.X, pp.Z + off.Z
+		local gp = groundTop(x, z)
+		local spot = Vector3.new(x, gp and gp.Y or (pp.Y - 3), z)
+		spots[#spots + 1] = spot
+		local disc = mk("Part", {
+			Anchored = true, CanCollide = false, CanTouch = false, CanQuery = false, Shape = Enum.PartType.Cylinder,
+			Size = Vector3.new(0.2, radius * 2, radius * 2), Color = Color3.fromRGB(255, 40, 40), Material = Enum.Material.Neon,
+			Transparency = 0.75, CFrame = CFrame.new(spot + Vector3.new(0, 0.25, 0)) * CFrame.Angles(0, 0, math.pi / 2),
+		}, folder)
+		Debris:AddItem(disc, 1.3)
+		ring(spot, radius, 1.1, Color3.fromRGB(255, 40, 40))
+	end
+	task.wait(1.1 / math.min(B.rage, 1.4))
+	if not running or B.dead then return end
+	shake(1.2, 0.5)
+	for _, spot in ipairs(spots) do
+		ring(spot, radius + 5, 0.4, Color3.fromRGB(255, 150, 40))
+		local p2 = Root.Position
+		if Vector3.new(p2.X - spot.X, 0, p2.Z - spot.Z).Magnitude < radius and p2.Y - spot.Y < 8 then hurt(dmg) end
+		safe(spawnTentacle, spot)
+		safe(corruptBatch, 6, spot, radius * 2.5, true)
+	end
+end
+
+local function groundCycle()
+	B.mode, B.speed = "chase", CFG.CHASE_SPEED[math.max(phase, 1)] or 26
+	local t0 = os.clock()
+	while running and not B.dead and os.clock() - t0 < 4 / B.rage do
+		local pp = Root.Position
+		if Vector3.new(pp.X - B.pos.X, 0, pp.Z - B.pos.Z).Magnitude < 20 and os.clock() - t0 > 1.0 then break end
+		task.wait(0.1)
+	end
+	if B.paused or B.stunned or B.dead then return end
+	slam()
+	if phase == 2 and not B.dead and not B.paused and not B.stunned and running then
+		for _, s in ipairs({ -0.3, 0, 0.3 }) do fireOrb(s, 52, 12) end
+	end
+end
+
+local FANS = {
+	[3] = { -0.22, 0, 0.22 },
+	[4] = { -0.45, -0.22, 0, 0.22, 0.45 },
+	[5] = { -0.6, -0.4, -0.2, 0, 0.2, 0.4, 0.6 },
+}
+
+local function floatCycle()
+	local ph = phase
+	B.mode, B.speed = "orbit", CFG.ORBIT_SPEED[ph] or 36
+	local w = CFG.FLOAT_WAIT[ph] or 2
+	task.wait(rng:NextNumber(w, w + 1) / B.rage)
+	if B.stunned or B.paused or B.dead or not running then return end
+	B.cycle += 1
+	local speed, dmg = 45 + ph * 5, 12 + ph * 2
+	if ph == 3 and B.cycle % 2 == 0 then
+		eruption(3, 11, 22)
+		return
+	end
+	for _, s in ipairs(FANS[ph] or FANS[3]) do fireOrb(s, speed, dmg) end
+	if ph >= 4 then
+		task.wait(0.4)
+		if B.stunned or B.paused or B.dead or not running then return end
+		eruption(ph == 4 and 4 or 7, 11, 24)
+		if ph == 5 and not (B.stunned or B.paused or B.dead) then
+			task.wait(0.3)
+			for _, s in ipairs(FANS[5]) do fireOrb(s * 1.4, speed + 10, dmg) end -- second, wider volley
 		end
 	end
 end
@@ -740,6 +1145,7 @@ end
 local function damageBoss(n)
 	if B.shielded or B.paused or B.dead then return end
 	B.hp -= n
+	B.rage = 1 + (1 - math.clamp(B.hp / B.maxhp, 0, 1)) * 0.6 -- the more you hurt him, the faster he gets
 	if B.hl then
 		B.hl.FillTransparency = 0
 		TweenService:Create(B.hl, TweenInfo.new(0.25), { FillTransparency = 0.6 }):Play()
@@ -759,12 +1165,19 @@ local function swordHit()
 	if not B.shielded and not B.paused and not B.dead then
 		if Vector3.new(B.pos.X - pp.X, 0, B.pos.Z - pp.Z).Magnitude < 22 then damageBoss(CFG.SWORD_DAMAGE) end
 	end
-	-- tentacles: one slice deletes them
+	-- tentacles: one slice deletes the ones in front of you (closest point of the body counts)
 	for i = #tentacles, 1, -1 do
 		local t = tentacles[i]
-		local v = Vector3.new(t.base.X - pp.X, 0, t.base.Z - pp.Z)
-		local m = v.Magnitude
-		if m < 15 and (m < 4 or v.Unit:Dot(look) > -0.2) then killTentacle(i) end
+		local best, bv = 1e9, nil
+		for k = 1, TSEG + 1 do
+			local pt = t.pts[k]
+			if pt then
+				local v = Vector3.new(pt.X - pp.X, 0, pt.Z - pp.Z)
+				local m = v.Magnitude
+				if m < best then best, bv = m, v end
+			end
+		end
+		if bv and best < 13 and (best < 5 or bv.Unit:Dot(look) > 0) then killTentacle(i) end
 	end
 	-- legged monsters: exactly 2 hits
 	for i = #monsters, 1, -1 do
@@ -775,7 +1188,7 @@ local function swordHit()
 		if m < mo.radius + 11 and (m < 5 or v.Unit:Dot(look) > -0.2) then
 			mo.hits += 1
 			if mo.hits >= 2 then
-				killMonster(i, true)
+				killMonster(i, rng:NextNumber() < (CFG.MON_GEM[math.max(phase, 1)] or 0.5))
 			else
 				local away = m > 0.1 and v.Unit or look
 				mo.pr.AssemblyLinearVelocity = away * 40 + Vector3.new(0, 25, 0)
@@ -851,24 +1264,29 @@ function startPhase(n)
 	B.paused, B.stunned = false, false
 	B.hp = CFG.BOSS_HP[n]
 	B.maxhp = B.hp
+	B.rage, B.cycle = 1, 0
 	gemCount = 0
 	if B.shield then B.shield:Destroy() B.shield = nil end
 	if n >= 3 then
 		B.shielded = true
 		makeShield()
-		B.heightTarget, B.hRate, B.mode, B.speed = CFG.HOVER_HEIGHT, 1.5, "orbit", 30
+		B.heightTarget, B.hRate, B.mode, B.speed = CFG.HOVER_HEIGHT, 1.5, "orbit", CFG.ORBIT_SPEED[n] or 36
 	else
 		B.shielded = false
 		B.heightTarget, B.hRate, B.mode = BODY_H, 6, "chase"
 	end
-	if n ~= 3 and n ~= 5 then restoreCorruption(false) end
+	setMood(n)
 	flash(Color3.fromRGB(255, 0, 60), 0.4, 1)
 	shake(2, 0.8)
 	say(string.format("PHASE %d - %s", n, PHASE_NAMES[n]), 3.5)
 	updateUI()
-	if n >= 2 then -- one 2s control inversion per phase
-		task.delay(rng:NextNumber(5, 12), function()
-			if running and phase == n and not dead and not B.dead then invert() end
+	-- control inversions (2s each), more of them every phase
+	local at = rng:NextNumber(5, 9)
+	for _ = 1, CFG.INVERT_COUNT[n] or 0 do
+		local when = at
+		at += rng:NextNumber(8, 12)
+		task.delay(when, function()
+			if running and phase == n and not dead and not B.dead and not B.paused then invert() end
 		end)
 	end
 end
@@ -877,8 +1295,10 @@ function nextPhase()
 	B.paused, B.stunned, B.shielded = true, false, false
 	B.mode = "idle"
 	B.heightTarget, B.hRate = BODY_H, 3
-	clearHazards()
+	clearHazards() -- hazards go, but the corruption stays forever
 	if B.shield then B.shield:Destroy() B.shield = nil end
+	playerHP = math.min(CFG.PLAYER_HP, playerHP + CFG.HEAL_ON_CLEAR)
+	updateUI()
 	say(string.format("PHASE %d CLEARED", phase), 2.5)
 	flash(Color3.new(1, 1, 1), 0.2, 1)
 	local n = phase + 1
@@ -890,7 +1310,6 @@ end
 function victory()
 	B.dead, B.paused = true, true
 	clearHazards()
-	restoreCorruption(false)
 	if B.shield then B.shield:Destroy() B.shield = nil end
 	say("THE NIGHTMARE IS PURIFIED", 6)
 	flash(Color3.new(1, 1, 1), 0, 2)
@@ -920,9 +1339,12 @@ function cleanup()
 	pcall(function() RunService:UnbindFromRenderStep("NB_Invert") end)
 	pcall(function() CAS:UnbindAction("NB_Sword") end)
 	pcall(function() CAS:UnbindAction("NB_Dash") end)
-	restoreCorruption(true)
-	for _, mo in ipairs(monsters) do pcall(setHidden, mo.src, false) end
+	-- NOTE: corrupted / consumed map parts are intentionally NOT restored
 	pcall(function() Hum.CameraOffset = Vector3.zero end)
+	pcall(function() cc:Destroy() end)
+	pcall(function()
+		Lighting.FogColor, Lighting.FogStart, Lighting.FogEnd = origFog[1], origFog[2], origFog[3]
+	end)
 	pcall(function() gui:Destroy() end)
 	pcall(function() folder:Destroy() end)
 	if genv.NB_CLEANUP == cleanup then genv.NB_CLEANUP = nil end
@@ -943,6 +1365,7 @@ conns[#conns + 1] = RunService.Heartbeat:Connect(function(dt)
 	local ok, err = pcall(function()
 		bossStep(dt)
 		hazardStep(dt)
+		eyeStep()
 	end)
 	if not ok and not warned then warned = true warn("[NightmareBoss] " .. tostring(err)) end
 end)
@@ -960,25 +1383,53 @@ task.spawn(function()
 		if B.paused or B.stunned then
 			task.wait(0.1)
 		elseif phase <= 2 then
-			groundCycle()
+			safe(groundCycle)
 		else
-			floatCycle()
+			safe(floatCycle)
 		end
 	end
 end)
 
--- hazard director
+-- hazard director: tentacles everywhere, crawler swarms, permanent corruption
 task.spawn(function()
-	local tT, tM, tG = 0, 0, 0
+	local tT, tM, tC, tB = 0, 0, 0, 0
 	while running and not dead do
-		task.wait(0.5)
-		if B.paused or B.dead then continue end
+		task.wait(0.1)
+		if B.paused or B.dead or phase < 1 then continue end
 		local now = os.clock()
-		local maxT = (phase == 2 and 7) or (phase == 3 and 2) or (phase == 5 and 5) or 0 -- phase 3 sprouts a few as gem sources
-		if #tentacles < maxT and now - tT > (phase == 2 and 2.5 or 5) then tT = now spawnTentacle() end
-		local maxM = (phase == 4 and 3) or (phase == 5 and 3) or 0
-		if #monsters < maxM and now - tM > (phase == 4 and 6 or 9) then tM = now spawnMonster() end
-		if (phase == 3 or phase == 5) and now - tG > 2 then tG = now corruptRandom() end
+		local ph = phase
+		local rage = B.rage
+
+		local tcap = CFG.TENT_CAP[ph] or 0
+		if tcap > 0 and now - tT > (CFG.TENT_INTERVAL[ph] or 1) / rage then
+			tT = now
+			for _ = 1, (ph >= 4 and 2 or 1) do
+				if #tentacles >= tcap then safe(pruneFarTentacle) end
+				if #tentacles < tcap then safe(spawnTentacle) end
+			end
+		end
+
+		local mcap = CFG.MON_CAP[ph] or 0
+		if mcap > 0 and now - tM > (CFG.MON_INTERVAL[ph] or 1) / rage then
+			tM = now
+			for _ = 1, (ph >= 5 and 2 or 1) do
+				if #monsters < mcap then safe(spawnMonster) end
+			end
+		end
+
+		if ph >= 2 and now - tC > (CFG.CORRUPT_INTERVAL[ph] or 2) / rage then
+			tC = now
+			safe(corruptBatch, CFG.CORRUPT_BATCH[ph] or 5)
+			if ph >= 4 and rng:NextNumber() < 0.25 then shake(0.6, 0.5) end -- the world rumbles
+		end
+
+		if ph >= 4 and now - tB > (ph == 4 and 14 or 9) then -- big reality wave
+			tB = now
+			say("REALITY IS BLEEDING", 2.5)
+			flash(Color3.fromRGB(200, 0, 80), 0.6, 1)
+			shake(2, 1)
+			safe(corruptBatch, 60, nil, 200)
+		end
 	end
 end)
 
