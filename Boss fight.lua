@@ -1,10 +1,12 @@
 --[[
-    CONSOLE_ROOT  //  BOSS FIGHT v3   (client-side LocalScript, run via Delta)
+    CONSOLE_ROOT  //  BOSS FIGHT v4   (client-side LocalScript, run via Delta)
     - Boss = a clone of YOUR avatar
     - You START with a Sword (model 47433). Phase 1: 1 dmg per swing.
     - Phase 1 CALM    : boss strolls, rarely throws things, only mild commands
-    - Phase 2 ENRAGED : INTENSE. cutscene, flies, telekinesis, dive-slams (sword window)
-    - Phase 3 MANIAC  : cutscene, glitch dialogue, command spam, neon-black clones (5 dmg/hit)
+    - Phase 2 ENRAGED : INTENSE. cutscene, flies, telekinesis, dive-slams (sword window),
+                        LASER DROPS: he lasers map objects and they fall on you (80 dmg)
+    - Phase 3 MANIAC  : cutscene, glitch dialogue, command spam, neon-black clones (5 dmg/hit),
+                        double laser drops
     - Healing potions (model 2694037886) spawn around the map: +10 HP
     - Music per phase
     Everything is local (only you see it). Stop it any time with:  _G.CR_CLEANUP()
@@ -39,13 +41,16 @@ local CFG = {
 	POTION_EVERY    = {12, 9, 7},  -- seconds between potion spawns, per phase
 	POTION_MAX      = 4,
 	POTION_LIFETIME = 45,
+	FALL_DMG        = 80,          -- damage when a laser-dropped object lands on you
+	DROP_RANGE      = 30,          -- boss picks objects within this many studs of you
+	DROP_GRAVITY    = 0.7,         -- 1 = normal gravity, lower = more time to dodge
 }
 
 ----------------------------------------------------------------------
 -- STATE / HELPERS
 ----------------------------------------------------------------------
 local S = {
-	phase = 0, hp = 100, running = true, busy = true, hover = false, over = false, diving = false,
+	phase = 0, hp = 100, running = true, busy = true, hover = false, over = false, diving = false, knocked = false,
 	conns = {}, objs = {}, restore = {}, hidden = {}, rb = {}, clones = {}, projs = {}, potions = {},
 	lastCmd = 0, nextMove = 0, nextThrow = 0, nextDive = 0, nextPotion = 0, dir = 1,
 }
@@ -801,6 +806,127 @@ task.spawn(function() -- potion spawner
 end)
 
 ----------------------------------------------------------------------
+-- FALLING PARTS (laser drops, phase 2 & 3): object falls, 80 dmg + fall anim if it lands on you
+----------------------------------------------------------------------
+local function Marker(pos, d) -- pulsing red warning circle on the ground where it will land
+	local m = mk("Part", {
+		Anchored = true, CanCollide = false, CanQuery = false, CanTouch = false, Material = Enum.Material.Neon,
+		Color = Color3.fromRGB(255, 40, 40), Transparency = 0.5, Shape = Enum.PartType.Cylinder,
+		Size = Vector3.new(0.2, d, d), CFrame = CFrame.new(pos) * CFrame.Angles(0, 0, math.rad(90)),
+	}, S.folder)
+	TS:Create(m, TweenInfo.new(0.25, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true), {Transparency = 0.85}):Play()
+	return m
+end
+
+local function Knockdown() -- tumble + fall animation after getting crushed
+	local h, pr = pHum(), pRoot()
+	if not h or not pr or h.Health <= 0 or S.knocked then return end
+	S.knocked = true
+	h.PlatformStand = true
+	pr.AssemblyLinearVelocity = Vector3.new(rnd:NextNumber(-8, 8), -30, rnd:NextNumber(-8, 8))
+	pr.AssemblyAngularVelocity = Vector3.new(rnd:NextNumber(-6, 6), rnd:NextNumber(-6, 6), rnd:NextNumber(-6, 6))
+	local trk
+	local an = h:FindFirstChildOfClass("Animator")
+	if an then
+		pcall(function()
+			local a = mk("Animation", {AnimationId = "rbxassetid://" .. (h.RigType == Enum.HumanoidRigType.R15 and 507767968 or 180436148)})
+			trk = an:LoadAnimation(a)
+			trk.Priority = Enum.AnimationPriority.Action
+			trk.Looped = true
+			trk:Play(0.05)
+		end)
+	end
+	task.wait(2.2)
+	if trk then pcall(function() trk:Stop(0.2) end) end
+	if h.Parent then
+		h.PlatformStand = false
+		h:ChangeState(Enum.HumanoidStateType.GettingUp)
+	end
+	S.knocked = false
+end
+
+local function PickDropPart() -- prefers objects hanging above you, otherwise any nearby object
+	local pr = pRoot()
+	if not pr then return nil end
+	local over, near = {}, {}
+	for _, p in ipairs(Parts()) do
+		if p.Parent and p.LocalTransparencyModifier < 1 and not S.hidden[p] then
+			local off = p.Position - pr.Position
+			if flat(off).Magnitude < CFG.DROP_RANGE then
+				if off.Y > 4 and off.Y < 70 then over[#over + 1] = p
+				elseif off.Y > -12 then near[#near + 1] = p end
+			end
+		end
+	end
+	local list = (#over > 0 and (#near == 0 or rnd:NextNumber() < 0.7)) and over or near
+	if #list == 0 then return nil end
+	return list[rnd:NextInteger(1, #list)]
+end
+
+local function DropPart(src)
+	if not src or not src.Parent or S.over then return end
+	local pr = pRoot()
+	if not pr then return end
+	local p = NewProj(src) -- visual copy, hides the original for a few seconds
+	local sz = p.Size
+	local g = workspace.Gravity * CFG.DROP_GRAVITY
+	local rp = RaycastParams.new()
+	rp.FilterType = Enum.RaycastFilterType.Exclude
+	rp.FilterDescendantsInstances = {S.folder, Boss, LP.Character, src}
+
+	local off = src.Position - pr.Position
+	local below = workspace:Raycast(src.Position, Vector3.new(0, -400, 0), rp)
+	local groundY = below and below.Position.Y or (pr.Position.Y - 3)
+	local h0 = math.max(src.Position.Y - sz.Y / 2 - groundY, 0.5)
+	local vy = (off.Y < 4) and 62 or -4 -- low objects get blasted into the air first
+	local t = (vy + math.sqrt(vy * vy + 2 * g * h0)) / g -- time until it lands
+	local aimAt = pr.Position + pr.AssemblyLinearVelocity * 0.25
+	local toP = flat(aimAt - src.Position)
+	local vxz = toP * rnd:NextNumber(0.85, 1.0) / t -- drifts toward where you are
+	local vel = Vector3.new(vxz.X, vy, vxz.Z)
+
+	local land = src.Position + Vector3.new(vxz.X * t, 0, vxz.Z * t)
+	local lr = workspace:Raycast(land + Vector3.new(0, 60, 0), Vector3.new(0, -400, 0), rp)
+	local marker = Marker(Vector3.new(land.X, (lr and lr.Position.Y or groundY) + 0.15, land.Z), math.max(sz.X, sz.Z) * 1.4 + 6)
+	local spin = Vector3.new(rnd:NextNumber(-4, 4), rnd:NextNumber(-4, 4), rnd:NextNumber(-4, 4))
+
+	task.spawn(function()
+		local result
+		local t0 = os.clock()
+		while S.running and p.Parent and os.clock() - t0 < 6 do
+			local dt = RS.Heartbeat:Wait()
+			if S.busy or S.over then break end
+			vel = vel + Vector3.new(0, -g * dt, 0)
+			local step = vel * dt
+			p.CFrame = p.CFrame * CFrame.Angles(spin.X * dt, spin.Y * dt, spin.Z * dt) + step
+			local r = pRoot()
+			if r and (r.Position - p.Position).Magnitude < p.Size.Magnitude / 2 + 2.5 then
+				result = "hit"
+				break
+			end
+			if vel.Y < 0 then
+				local ray = workspace:Raycast(p.Position, step + Vector3.new(0, -sz.Y / 2, 0), rp)
+				if ray then result = "land" break end
+			end
+		end
+		if marker.Parent then marker:Destroy() end
+		local pos = p.Position
+		if p.Parent then p:Destroy() end
+		if S.over or S.busy or not S.running then return end
+		if result == "hit" then
+			Boom(pos, 8)
+			Hurt(CFG.FALL_DMG)
+			Shake(3, 0.8)
+			Term("IMPACT :: -" .. CFG.FALL_DMG .. " HP")
+			task.spawn(Knockdown)
+		elseif result == "land" then
+			Boom(pos, 6) Shake(0.8, 0.3)
+			Ring(pos, Color3.fromRGB(255, 80, 80), 18, 0.5)
+		end
+	end)
+end
+
+----------------------------------------------------------------------
 -- BOSS COMMANDS
 ----------------------------------------------------------------------
 local Cmd = {}
@@ -833,6 +959,29 @@ function Cmd.laser()
 	end
 	TS:Create(line, TweenInfo.new(0.35), {Transparency = 1}):Play()
 	Debris:AddItem(line, 0.4)
+end
+
+function Cmd.laserprop() -- lasers a map object so it falls (phase 2 & 3 only)
+	local pr = pRoot()
+	if not pr or not Boss or S.phase < 2 then return end
+	local src = PickDropPart()
+	if not src then return Cmd.laser() end -- nothing nearby: normal laser at you
+	Term(";laser " .. src.Name)
+	local head = Boss.Head
+	local line = NewNeon(Color3.fromRGB(255, 0, 0), 0.4)
+	for i = 1, 8 do
+		if not S.running or S.busy or not src.Parent or S.hidden[src] then line:Destroy() return end
+		Seg(line, head.Position, src.Position, 0.25)
+		line.Transparency = (i % 2 == 0) and 0.6 or 0.2
+		task.wait(0.06)
+	end
+	line.Color = Color3.new(1, 1, 1) line.Transparency = 0
+	Seg(line, head.Position, src.Position, 1.8)
+	TS:Create(line, TweenInfo.new(0.3), {Transparency = 1}):Play()
+	Debris:AddItem(line, 0.35)
+	Shake(1, 0.3) Boom(src.Position, 5)
+	if S.busy or S.over then return end
+	DropPart(src)
 end
 
 function Cmd.slip()
@@ -960,7 +1109,9 @@ local function PickCmd()
 	local pool = {}
 	local function add(n, w) for _ = 1, w do pool[#pool + 1] = n end end
 	add("laser", 3) add("blackscreen", 1) add("fling", 2) add("slip", 2) add("jail", 2) add("freeze", 1)
+	add("laserprop", S.phase == 3 and 4 or 3)                           -- laser objects so they fall on you
 	if d < 22 then add("slip", 3) add("fling", 3) add("jail", 2) end   -- you're close: punish
+	if d < 30 then add("laserprop", 2) end
 	if holdingProp() then add("blackscreen", 3) add("laser", 2) end   -- you're armed: blind/shoot you
 	if S.black then
 		for i = #pool, 1, -1 do if pool[i] == "blackscreen" then table.remove(pool, i) end end
@@ -976,6 +1127,9 @@ local function RunCmd(name)
 	elseif name == "laser" and S.phase == 2 and rnd:NextNumber() < 0.4 then -- intense: double laser sometimes
 		task.spawn(Cmd.laser)
 		task.delay(0.5, Cmd.laser)
+	elseif name == "laserprop" then
+		task.spawn(Cmd.laserprop)
+		if S.phase == 3 then task.delay(0.6, Cmd.laserprop) end -- maniac: two objects at once
 	else
 		task.spawn(Cmd[name])
 	end
